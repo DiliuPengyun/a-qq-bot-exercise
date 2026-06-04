@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mem0 搜索日志</title>
+<style>
+* { box-sizing: border-box; }
+body { font-family: system-ui, -apple-system, sans-serif; max-width: 1100px; margin: 1rem auto; padding: 0 1rem; background: #1a1a2e; color: #e0e0e0; }
+nav { padding: .5rem 0; border-bottom: 1px solid #333; margin-bottom: 1rem; }
+nav a { color: #7ec8e3; margin-right: 1.2rem; text-decoration: none; font-size: .85rem; }
+nav a:hover { color: #ff6b9d; }
+h1 { color: #ff6b9d; font-size: 1.15rem; font-weight: 600; display: flex; align-items: center; gap: .5rem; }
+.card { background: #16213e; border: 1px solid #333; border-radius: 6px; margin: .5rem 0; transition: border-color .15s; }
+.card:hover { border-color: #555; }
+.card-header { display: flex; align-items: center; padding: .5rem .8rem; gap: .8rem; font-size: .8rem; cursor: pointer; }
+.card-header .ts { color: #888; font-family: monospace; font-size: .75rem; min-width: 60px; }
+.card-header .uid { color: #7ec8e3; font-family: monospace; font-size: .7rem; min-width: 90px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card-header .msg { flex: 1; color: #e0e0e0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card-header .badge { padding: 2px 8px; border-radius: 10px; font-size: .7rem; font-weight: 600; white-space: nowrap; }
+.badge-ok { background: #1a3a2a; color: #3fb950; }
+.badge-lo { background: #3a2a1a; color: #d29922; }
+.card-detail { display: none; padding: 0 .8rem .6rem; border-top: 1px solid #333; font-size: .75rem; }
+.round-block { margin: .5rem 0; }
+.round-title { font-weight: 600; color: #fff; margin-bottom: .4rem; font-size: .78rem; }
+.bar-wrap { display: flex; align-items: center; gap: .5rem; margin: .2rem 0; font-size: .7rem; }
+.bar-label { width: 45px; text-align: right; color: #888; flex-shrink: 0; }
+.bar-track { flex: 1; height: 5px; background: #333; border-radius: 3px; overflow: hidden; }
+.bar-fill { height: 100%; border-radius: 3px; }
+.bar-fill.emb { background: linear-gradient(90deg, #1a3a5c, #7ec8e3); }
+.bar-fill.rerank { background: linear-gradient(90deg, #3a1a5c, #c87ee3); }
+.bar-val { width: 40px; font-family: monospace; font-size: .65rem; color: #e0e0e0; }
+.cols { display: flex; gap: .5rem; margin-top: .3rem; }
+.col { flex: 1; min-width: 0; background: #0f3460; border-radius: 4px; padding: .4rem; }
+.col-title { font-weight: 600; font-size: .72rem; margin-bottom: .3rem; padding-bottom: .2rem; border-bottom: 1px solid #333; }
+.col-title.left { color: #7ec8e3; }
+.col-title.right { color: #c87ee3; }
+.row { display: flex; align-items: baseline; gap: .3rem; padding: 1px 0; font-size: .7rem; border-bottom: 1px solid #16213e; }
+.row .sc { font-family: monospace; font-size: .65rem; min-width: 42px; flex-shrink: 0; }
+.row .tx { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row.drop { opacity: .45; }
+.sc.dim { color: #888; }
+.sc.ok { color: #4ecca3; }
+.sc.lo { color: #ff6b6b; }
+.sc.em { color: #7ec8e3; }
+.pass { color: #4ecca3; }
+.fail { color: #ff6b6b; }
+.muted { color: #888; font-size: .68rem; }
+.tag { display: inline-block; padding: 1px 5px; border-radius: 3px; font-size: .65rem; margin: 1px 2px; }
+.tag-e { background: #1a3a5c; color: #7ec8e3; }
+.tag-r { background: #3a1a5c; color: #c87ee3; }
+.tag-p { background: #1a3a2a; color: #7ee3a8; }
+.tag-d { background: #3a1a1a; color: #ffa198; }
+button { background: #ff6b9d; color: #fff; border: none; padding: .3rem .7rem; border-radius: 4px; cursor: pointer; font-size: .75rem; }
+button:hover { background: #ff85b5; }
+.auto-badge { font-size: .65rem; padding: 2px 6px; border-radius: 8px; background: #1a3a2a; color: #4ecca3; }
+.paused { background: #3a1a1a; color: #ff6b6b; }
+</style>
+</head>
+<body>
+<nav><a href="/">🏠 首页</a><a href="/admin">💻 控制台</a><a href="/mem0">🔍 Mem0日志</a><a href="/memories">🧠 记忆库</a></nav>
+<h1>🔍 Mem0 搜索日志 <span class="muted" id="count"></span> <button onclick="toggleAuto()" id="autoBtn" class="auto-badge">⏸ 暂停自动刷新</button></h1>
+<div id="list"></div>
+<script>
+let expanded = new Set();
+let autoRefresh = true;
+let timer = null;
+
+function toggleAuto() {
+    autoRefresh = !autoRefresh;
+    let btn = document.getElementById('autoBtn');
+    if (autoRefresh) { btn.textContent = '⏸ 暂停自动刷新'; btn.className = 'auto-badge'; timer = setInterval(load, 8000); }
+    else { btn.textContent = '▶ 已暂停'; btn.className = 'auto-badge paused'; clearInterval(timer); }
+}
+
+function buildKey(e) { return (e.ts||'') + '|' + (e.message||'').slice(0,30); }
+
+function makeScore(s, clsOk, clsLo) {
+    return '<span class="sc ' + (s > 0 ? clsOk : clsLo) + '">' + s.toFixed(3) + '</span>';
+}
+
+async function load() {
+    let r = await fetch('/mem0-log');
+    let data = await r.json();
+    document.getElementById('count').textContent = '（共 ' + data.length + ' 条）';
+    let html = '';
+    data.reverse().forEach((e, i) => {
+        let key = buildKey(e);
+        let ts = e.ts ? e.ts.slice(11, 19) : '-';
+        let uid = (e.user_id || '-').slice(-16);
+        let msg = e.message || '-';
+        let total = e.total || 0;
+        html += '<div class="card" data-key="' + key.replace(/"/g,'&quot;') + '">';
+        html += '<div class="card-header"><span class="ts">' + ts + '</span><span class="uid">' + uid + '</span><span class="msg">' + msg + '</span>';
+        html += '<span class="badge ' + (total > 0 ? 'badge-ok' : 'badge-lo') + '">' + total + ' 条</span></div>';
+        html += '<div class="card-detail" id="d' + i + '">';
+        (e.rounds||[]).forEach((r, ri) => {
+            html += '<div class="round-block">';
+            html += '<div class="round-title">第' + (ri+1) + '轮 <span class="muted">' + (r.round_query||'').slice(0,60) + '</span></div>';
+            // 进度条
+            let embPct = Math.round(r.candidates / 50 * 100);
+            html += '<div class="bar-wrap"><span class="bar-label">海选</span><span class="bar-track"><span class="bar-fill emb" style="width:' + embPct + '%"></span></span><span class="bar-val">' + r.candidates + '条</span></div>';
+            html += '<span class="tag tag-e">min ' + r.emb_min + '</span><span class="tag tag-e">max ' + r.emb_max + '</span><span class="tag tag-e">avg ' + r.emb_avg + '</span>';
+            if (r.dropped_emb) html += '<span class="tag tag-d">-' + r.dropped_emb + '</span>';
+            html += ' <span class="muted">→' + r.qualified + '条重排</span>';
+            if (r.rerank_count) {
+                html += ' &nbsp;';
+                let rrkPct = Math.round(r.rerank_count / 50 * 100);
+                html += '<span class="tag tag-r">重排min ' + r.rerank_min + ' max ' + r.rerank_max + '</span>';
+                if (r.dropped_rerank) html += '<span class="tag tag-d">-' + r.dropped_rerank + '</span>';
+                html += '<span class="tag tag-p">✓' + r.passed + '条</span>';
+            }
+            // 双栏：左海选，右选拔
+            html += '<div class="cols">';
+            // 左：海选
+            html += '<div class="col"><div class="col-title left">🔵 海选（Embedding）</div>';
+            let embCands = r.emb_candidates || [];
+            embCands.sort((a,b) => b.score - a.score);
+            embCands.forEach(c => {
+                html += '<div class="row' + (c.passed ? '' : ' drop') + '">';
+                html += makeScore(c.score, 'em', 'dim');
+                html += '<span class="tx">' + (c.memory||'') + '</span></div>';
+            });
+            if (!embCands.length) html += '<span class="muted">无候选</span>';
+            html += '</div>';
+            // 右：选拔
+            html += '<div class="col"><div class="col-title right">🟣 选拔（Reranker）</div>';
+            let rerankCands = r.rerank_candidates || [];
+            rerankCands.sort((a,b) => b.rerank_score - a.rerank_score);
+            rerankCands.forEach(c => {
+                html += '<div class="row' + (c.passed ? '' : ' drop') + '">';
+                html += makeScore(c.rerank_score, 'ok', 'lo');
+                html += '<span class="sc dim">e' + (c.emb_score||0).toFixed(3) + '</span>';
+                html += '<span class="tx">' + (c.memory||'') + '</span></div>';
+            });
+            if (!rerankCands.length) html += '<span class="muted">无候选</span>';
+            html += '</div>';
+            html += '</div>'; // cols
+            html += '</div>'; // round-block
+        });
+        html += '</div></div>'; // card-detail, card
+    });
+    document.getElementById('list').innerHTML = html;
+
+    // 点击 header 切换展开，点击 detail 内部不折叠
+    document.querySelectorAll('.card').forEach((c, i) => {
+        let key = c.getAttribute('data-key');
+        let header = c.querySelector('.card-header');
+        let detail = document.getElementById('d' + i);
+        if (!header || !detail) return;
+        header.addEventListener('click', function(ev) {
+            ev.stopPropagation();
+            if (expanded.has(key)) { expanded.delete(key); detail.style.display = 'none'; }
+            else { expanded.add(key); detail.style.display = 'block'; }
+        });
+        if (expanded.has(key)) detail.style.display = 'block';
+    });
+}
+
+load();
+timer = setInterval(load, 8000);
+</script>
+</body>
+</html>

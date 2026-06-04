@@ -1,0 +1,37 @@
+adapters:
+- config:
+    ws_token: ${NAPCAT_WS_TOKEN}
+    ws_uri: ws://127.0.0.1:3001
+  enabled: true
+  platform: qq
+  type: napcat
+bot_uin: 'YOUR_BOT_UIN'
+check_ncatbot_update: true
+debug: false
+enable_webui_interaction: true
+http_proxy: http://127.0.0.1:7897
+logging:
+  event_log_format: summary
+  event_log_levels:
+    meta_event: NONE
+plugin:
+  auto_install_pip_deps: true
+  builtin_commands:
+    config_toggle: true
+    load: true
+    reload: true
+    sysinfo: true
+    unload: true
+  builtin_commands_group_allowed: false
+  enable_builtin_commands: true
+  hot_reload: true
+  load_plugin: false
+  plugin_blacklist: []
+  plugin_configs: {}
+  plugin_whitelist: []
+  plugins_dir: plugins
+  skip_pip_install_confirm: false
+root: 'YOUR_ROOT_UIN'
+skip_napcat_install_confirm: false
+skip_ncatbot_install_check: false
+websocket_timeout: 15

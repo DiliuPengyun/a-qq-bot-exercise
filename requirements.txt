@@ -1,0 +1,5 @@
+ncatbot5>=5.5
+mem0ai>=2.0
+httpx>=0.27
+aiohttp>=3.13
+python-dotenv>=1.2

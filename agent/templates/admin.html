@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第六谷绫 控制台</title>
+<style>
+body { font-family: system-ui; max-width: 600px; margin: 2rem auto; padding: 0 1rem; background: #1a1a2e; color: #e0e0e0; }
+nav a { color: #7ec8e3; margin-right: 1rem; text-decoration: none; font-size: .85rem; }
+nav a:hover { color: #ff6b9d; }
+h1 { color: #ff6b9d; }
+.card { background: #16213e; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+button { background: #ff6b9d; color: #fff; border: none; padding: .5rem 1rem; border-radius: 4px; cursor: pointer; }
+button:disabled { opacity: .5; }
+input, select { padding: .4rem; border-radius: 4px; border: 1px solid #333; background: #0f3460; color: #fff; width: 200px; }
+.status { font-family: monospace; font-size: .85rem; white-space: pre-wrap; max-height: 300px; overflow-y: auto; }
+</style>
+</head>
+<body>
+<nav style="margin-bottom:1rem"><a href="/">🏠 首页</a> <a href="/admin">💻 控制台</a> <a href="/mem0">🔍 Mem0日志</a> <a href="/memories">🧠 记忆库</a></nav>
+<h1>💻 第六谷绫 控制台</h1>
+
+<div class="card">
+<h3>📅 手动结算</h3>
+<select id="uid"><option value="">-- 选择群/用户 --</option></select>
+<button onclick="settle()">执行结算</button>
+<p class="status" id="settleResult"></p>
+</div>
+
+<div class="card">
+<h3>📋 当前动态提示词</h3>
+<p class="status" id="promptView"></p>
+</div>
+
+<script>
+async function loadUsers() {
+    let r = await fetch('/sessions');
+    let data = await r.json();
+    let sel = document.getElementById('uid');
+    data.sessions.forEach(s => {
+        let opt = document.createElement('option');
+        opt.value = s; opt.textContent = s;
+        sel.appendChild(opt);
+    });
+}
+async function settle() {
+    let uid = document.getElementById('uid').value;
+    if (!uid) return;
+    let btn = document.querySelector('button');
+    btn.disabled = true; btn.textContent = '结算中...';
+    let r = await fetch('/settle', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({user_id: uid}) });
+    let data = await r.json();
+    document.getElementById('settleResult').textContent = JSON.stringify(data, null, 2);
+    btn.disabled = false; btn.textContent = '执行结算';
+    loadPrompt();
+}
+async function loadPrompt() {
+    let r = await fetch('/dynamic-prompt');
+    document.getElementById('promptView').textContent = await r.text();
+}
+loadUsers();
+loadPrompt();
+</script>
+</body>
+</html>

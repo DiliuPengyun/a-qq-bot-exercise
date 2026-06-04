@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>所有记忆</title>
+<style>
+body { font-family: system-ui; max-width: 1000px; margin: 1rem auto; padding: 0 1rem; background: #1a1a2e; color: #e0e0e0; }
+nav a { color: #7ec8e3; margin-right: 1rem; text-decoration: none; font-size: .85rem; }
+nav a:hover { color: #ff6b9d; }
+h1 { color: #ff6b9d; font-size: 1.2rem; }
+table { width: 100%; border-collapse: collapse; font-size: .8rem; }
+th, td { padding: .3rem .5rem; border-bottom: 1px solid #333; text-align: left; max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+th { color: #aaa; }
+tr:hover { background: #16213e; }
+button { background: #ff6b6b; color: #fff; border: none; padding: .2rem .5rem; border-radius: 3px; cursor: pointer; font-size: .7rem; }
+input, select { padding: .3rem; border-radius: 4px; border: 1px solid #333; background: #0f3460; color: #fff; }
+input { width: 200px; }
+.muted { color: #888; font-size: .75rem; }
+</style>
+</head>
+<body>
+<nav style="margin-bottom:1rem"><a href="/">🏠 首页</a> <a href="/admin">💻 控制台</a> <a href="/mem0">🔍 Mem0日志</a> <a href="/memories">🧠 记忆库</a></nav>
+<h1>🧠 记忆库 <span class="muted" id="count"></span></h1>
+<div style="margin:.5rem 0">
+  <input id="filter" placeholder="搜索记忆..." oninput="render()">
+  <select id="uidFilter" onchange="render()"><option value="">全部用户</option></select>
+</div>
+<table id="tbl"></table>
+<script>
+let allData = [];
+async function load() {
+    let r = await fetch('/memories-json');
+    allData = await r.json();
+    let sel = document.getElementById('uidFilter');
+    let uids = [...new Set(allData.map(m => m.user_id || '-'))].sort();
+    sel.innerHTML = '<option value="">全部用户</option>';
+    uids.forEach(u => { let o = document.createElement('option'); o.value = u; o.textContent = u; sel.appendChild(o); });
+    render();
+}
+function render() {
+    let f = document.getElementById('filter').value.toLowerCase();
+    let u = document.getElementById('uidFilter').value;
+    let data = allData.filter(m => {
+        if (u && m.user_id !== u) return false;
+        if (f && !(m.memory||'').toLowerCase().includes(f)) return false;
+        return true;
+    });
+    document.getElementById('count').textContent = '共 ' + data.length + ' 条';
+    let html = '<tr><th>ID</th><th>内容</th><th>用户</th><th>操作</th></tr>';
+    data.forEach(m => {
+        html += '<tr><td style="font-family:monospace;font-size:.7rem">' + (m.id||'').slice(0,12) + '</td>';
+        html += '<td title="' + (m.memory||'').replace(/"/g,'&quot;') + '">' + (m.memory||'').slice(0,80) + '</td>';
+        html += '<td>' + (m.user_id||'-').slice(-16) + '</td>';
+        html += '<td><button onclick="del(\'' + m.id + '\')">删除</button></td></tr>';
+    });
+    document.getElementById('tbl').innerHTML = html;
+}
+async function del(id) {
+    if (!confirm('确认删除？')) return;
+    await fetch('/memories/delete', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id})});
+    load();
+}
+load();
+</script>
+</body>
+</html>
