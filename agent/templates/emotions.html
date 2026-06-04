@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>情感记忆</title>
+<style>
+body { font-family: system-ui; max-width: 1100px; margin: 1rem auto; padding: 0 1rem; background: #1a1a2e; color: #e0e0e0; }
+nav a { color: #7ec8e3; margin-right: 1rem; text-decoration: none; font-size: .85rem; }
+nav a:hover { color: #ff6b9d; }
+h1 { color: #ff6b9d; font-size: 1.2rem; }
+.card { background: #16213e; border: 1px solid #333; border-radius: 6px; padding: .75rem; margin: .7rem 0; }
+.user { border-left: 3px solid #ff6b9d; }
+.event { background: #0f3460; border: 1px solid #333; border-radius: 4px; padding: .45rem; margin: .35rem 0; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: .5rem; }
+input, textarea { padding: .35rem; border-radius: 4px; border: 1px solid #333; background: #0f3460; color: #fff; width: 100%; box-sizing: border-box; }
+textarea { min-height: 60px; resize: vertical; font-family: inherit; }
+label { display: block; color: #aaa; font-size: .75rem; margin: .35rem 0 .2rem; }
+button { background: #ff6b6b; color: #fff; border: none; padding: .25rem .55rem; border-radius: 3px; cursor: pointer; font-size: .72rem; margin: .25rem .25rem .25rem 0; }
+button.primary { background: #4ecca3; }
+button.secondary { background: #7ec8e3; }
+button.ghost { background: #444; }
+.muted { color: #888; font-size: .75rem; }
+.ok { color: #4ecca3; }
+.err { color: #ff6b6b; }
+.id { font-family: monospace; color: #aaa; font-size: .72rem; }
+@media (max-width: 700px) { .grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<nav><a href="/">🏠 首页</a> <a href="/admin">💻 控制台</a> <a href="/mem0">🔍 Mem0日志</a> <a href="/memories">🧠 记忆库</a> <a href="/emotions">💗 情感记忆</a></nav>
+<h1>💗 情感记忆 <span class="muted" id="count"></span></h1>
+<div class="card">
+  <div class="grid">
+    <div><label for="personId">person_id</label><input id="personId" placeholder="group_xxx:qq_xxx"></div>
+    <div><label for="displayName">显示名</label><input id="displayName" placeholder="群昵称（QQ昵称）"></div>
+  </div>
+  <label for="summary">30天前摘要</label><textarea id="summary"></textarea>
+  <button type="button" class="primary" onclick="saveUser()">保存用户/摘要</button>
+  <span id="status" class="muted"></span>
+</div>
+<div id="list"></div>
+<script>
+let data = {users:{}};
+function esc(s) { return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+function js(s) { return String(s || '').replace(/\\/g,'\\\\').replace(/'/g,"\\'"); }
+function status(t, ok) { let el = document.getElementById('status'); el.textContent = t || ''; el.className = 'muted ' + (ok ? 'ok' : 'err'); }
+async function api(url, body) {
+  let r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  let j = await r.json();
+  if (!r.ok || j.status !== 'ok') throw new Error(j.reason || ('HTTP ' + r.status));
+  return j;
+}
+async function load() { let r = await fetch('/emotions-json'); data = await r.json(); render(); }
+function render() {
+  let users = data.users || {};
+  let entries = Object.entries(users).sort((a,b) => String(b[1].updated_at||'').localeCompare(String(a[1].updated_at||'')));
+  document.getElementById('count').textContent = '共 ' + entries.length + ' 人';
+  let html = '';
+  entries.forEach(([pid, u]) => {
+    html += '<div class="card user"><b>' + esc(u.display_name || pid) + '</b> <span class="id">' + esc(pid) + '</span>';
+    html += '<div class="muted">updated_at: ' + esc(u.updated_at || '-') + '</div>';
+    html += '<label>30天前摘要</label><textarea id="sum_' + esc(pid) + '">' + esc(u.summary_before_30d || '') + '</textarea>';
+    html += '<button type="button" class="secondary" onclick="updateSummary(\'' + js(pid) + '\')">保存摘要</button>';
+    html += '<button type="button" onclick="deleteUser(\'' + js(pid) + '\')">删除用户</button>';
+    (u.logs || []).forEach((e, i) => {
+      html += '<div class="event">';
+      html += '<div class="grid"><div><label>start_at</label><input id="st_' + esc(pid) + '_' + i + '" value="' + esc(e.start_at || '') + '"></div>';
+      html += '<div><label>end_at</label><input id="en_' + esc(pid) + '_' + i + '" value="' + esc(e.end_at || '') + '"></div></div>';
+      html += '<label>事件</label><textarea id="ev_' + esc(pid) + '_' + i + '">' + esc(e.event || '') + '</textarea>';
+      html += '<label>情感影响</label><textarea id="em_' + esc(pid) + '_' + i + '">' + esc(e.emotion || '') + '</textarea>';
+      html += '<button type="button" class="primary" onclick="saveEvent(\'' + js(pid) + '\',' + i + ')">保存事件</button>';
+      html += '<button type="button" onclick="deleteEvent(\'' + js(pid) + '\',' + i + ')">删除事件</button></div>';
+    });
+    html += '<div class="event"><b>新增事件</b><div class="grid"><div><label>start_at</label><input id="newst_' + esc(pid) + '" placeholder="2026-06-04 01:23"></div>';
+    html += '<div><label>end_at</label><input id="newen_' + esc(pid) + '" placeholder="2026-06-04 01:31"></div></div>';
+    html += '<label>事件</label><textarea id="newev_' + esc(pid) + '"></textarea><label>情感影响</label><textarea id="newem_' + esc(pid) + '"></textarea>';
+    html += '<button type="button" class="primary" onclick="addEvent(\'' + js(pid) + '\')">新增事件</button></div></div>';
+  });
+  document.getElementById('list').innerHTML = html || '<div class="muted">暂无情感记忆</div>';
+}
+async function saveUser() {
+  let person_id = document.getElementById('personId').value.trim();
+  let display_name = document.getElementById('displayName').value.trim();
+  let summary_before_30d = document.getElementById('summary').value.trim();
+  if (!person_id) { status('person_id 不能为空', false); return; }
+  try { await api('/emotions/user', {person_id, display_name, summary_before_30d}); status('保存成功', true); await load(); } catch(e) { status('保存失败：' + e.message, false); }
+}
+async function updateSummary(pid) {
+  let u = data.users[pid] || {};
+  let summary_before_30d = document.getElementById('sum_' + pid).value.trim();
+  try { await api('/emotions/user', {person_id:pid, display_name:u.display_name || pid, summary_before_30d}); status('摘要已保存', true); await load(); } catch(e) { status('保存失败：' + e.message, false); }
+}
+async function addEvent(pid) {
+  let u = data.users[pid] || {};
+  let body = {person_id:pid, display_name:u.display_name || pid, start_at:val('newst_'+pid), end_at:val('newen_'+pid), event:val('newev_'+pid), emotion:val('newem_'+pid)};
+  try { await api('/emotions/event/add', body); status('事件已新增', true); await load(); } catch(e) { status('新增失败：' + e.message, false); }
+}
+async function saveEvent(pid, i) {
+  let body = {person_id:pid, index:i, start_at:val('st_'+pid+'_'+i), end_at:val('en_'+pid+'_'+i), event:val('ev_'+pid+'_'+i), emotion:val('em_'+pid+'_'+i)};
+  try { await api('/emotions/event/update', body); status('事件已保存', true); await load(); } catch(e) { status('保存失败：' + e.message, false); }
+}
+async function deleteEvent(pid, i) { try { await api('/emotions/delete', {person_id:pid, index:i}); status('事件已删除', true); await load(); } catch(e) { status('删除失败：' + e.message, false); } }
+async function deleteUser(pid) { try { await api('/emotions/delete', {person_id:pid}); status('用户已删除', true); await load(); } catch(e) { status('删除失败：' + e.message, false); } }
+function val(id) { let el = document.getElementById(id); return el ? el.value.trim() : ''; }
+load();
+</script>
+</body>
+</html>

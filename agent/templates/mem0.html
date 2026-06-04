@@ -58,7 +58,7 @@ button:hover { background: #ff85b5; }
 </style>
 </head>
 <body>
-<nav><a href="/">🏠 首页</a><a href="/admin">💻 控制台</a><a href="/mem0">🔍 Mem0日志</a><a href="/memories">🧠 记忆库</a></nav>
+<nav><a href="/">🏠 首页</a><a href="/admin">💻 控制台</a><a href="/mem0">🔍 Mem0日志</a><a href="/memories">🧠 记忆库</a><a href="/emotions">💗 情感记忆</a></nav>
 <h1>🔍 Mem0 搜索日志 <span class="muted" id="count"></span> <button onclick="toggleAuto()" id="autoBtn" class="auto-badge">⏸ 暂停自动刷新</button></h1>
 <div id="list"></div>
 <script>
@@ -97,16 +97,17 @@ async function load() {
         (e.rounds||[]).forEach((r, ri) => {
             html += '<div class="round-block">';
             html += '<div class="round-title">第' + (ri+1) + '轮 <span class="muted">' + (r.round_query||'').slice(0,60) + '</span></div>';
-            // 进度条
-            let embPct = Math.round(r.candidates / 50 * 100);
+            // 进度条：不再按固定候选上限计算，当前轮有候选就铺满。
+            let embPct = r.candidates > 0 ? 100 : 0;
             html += '<div class="bar-wrap"><span class="bar-label">海选</span><span class="bar-track"><span class="bar-fill emb" style="width:' + embPct + '%"></span></span><span class="bar-val">' + r.candidates + '条</span></div>';
             html += '<span class="tag tag-e">min ' + r.emb_min + '</span><span class="tag tag-e">max ' + r.emb_max + '</span><span class="tag tag-e">avg ' + r.emb_avg + '</span>';
             if (r.dropped_emb) html += '<span class="tag tag-d">-' + r.dropped_emb + '</span>';
             html += ' <span class="muted">→' + r.qualified + '条重排</span>';
             if (r.rerank_count) {
                 html += ' &nbsp;';
-                let rrkPct = Math.round(r.rerank_count / 50 * 100);
                 html += '<span class="tag tag-r">重排min ' + r.rerank_min + ' max ' + r.rerank_max + '</span>';
+                if (r.deduped_rerank) html += '<span class="tag tag-d">去重' + r.deduped_rerank + '</span>';
+                if (r.invalid_rerank_indexes) html += '<span class="tag tag-d">异常' + r.invalid_rerank_indexes + '</span>';
                 if (r.dropped_rerank) html += '<span class="tag tag-d">-' + r.dropped_rerank + '</span>';
                 html += '<span class="tag tag-p">✓' + r.passed + '条</span>';
             }
@@ -119,6 +120,7 @@ async function load() {
             embCands.forEach(c => {
                 html += '<div class="row' + (c.passed ? '' : ' drop') + '">';
                 html += makeScore(c.score, 'em', 'dim');
+                html += '<span class="sc dim">' + (c.id||'').slice(0,6) + '</span>';
                 html += '<span class="tx">' + (c.memory||'') + '</span></div>';
             });
             if (!embCands.length) html += '<span class="muted">无候选</span>';
@@ -131,6 +133,7 @@ async function load() {
                 html += '<div class="row' + (c.passed ? '' : ' drop') + '">';
                 html += makeScore(c.rerank_score, 'ok', 'lo');
                 html += '<span class="sc dim">e' + (c.emb_score||0).toFixed(3) + '</span>';
+                html += '<span class="sc dim">' + (c.id||'').slice(0,6) + '</span>';
                 html += '<span class="tx">' + (c.memory||'') + '</span></div>';
             });
             if (!rerankCands.length) html += '<span class="muted">无候选</span>';

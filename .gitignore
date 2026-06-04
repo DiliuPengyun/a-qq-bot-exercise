@@ -13,6 +13,7 @@ agent/qdrant_data/
 agent/settlement_times.json
 agent/dynamic_prompt.txt
 agent/mem0_log.json
+agent/emotions.json
 data/
 config.yaml
 config.local.yaml

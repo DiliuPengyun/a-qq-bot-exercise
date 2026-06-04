@@ -2,7 +2,7 @@
 DeepSeek Agent —— 接 DeepSeek V4 Flash，带 Mem0 长期记忆。
 
 功能：
-- 滚雪球记忆检索（id 判闭合，top_k=10，最多 2 轮）
+- 滚雪球记忆检索（id 判闭合，最多 2 轮）
 - 两个工具：should_quote（引用气泡）、forget_memory（消灭矛盾记忆）
 - 矛盾检测：同主题 + 不同 spoken_by → ⚠ 标记
 - 对话历史持久化（agent/sessions/）
@@ -19,16 +19,34 @@ import os
 import json
 import random
 import re
+import ast
 import asyncio
 from datetime import datetime, timedelta, timezone
+from typing import Any
 import httpx
 import traceback
 from aiohttp import web
 from dotenv import load_dotenv
 from mem0 import Memory
 from mem0.configs.base import MemoryConfig
+from mem0.llms.configs import LlmConfig
+from mem0.embeddings.configs import EmbedderConfig
+from mem0.vector_stores.configs import VectorStoreConfig
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+
+
+# ── 类型定义 ──────────────────────────────────────────────
+
+# 情感事件：{"start_at", "end_at", "event", "emotion"}
+EmotionEvent = dict[str, Any]
+# 单用户情感数据：{"display_name", "summary_before_30d", "logs", "updated_at"}
+EmotionUser = dict[str, Any]
+# emotions.json 顶层：{"schema_version", "updated_at", "migrated_dynamic_prompt", "users"}
+EmotionData = dict[str, Any]
+# 对话历史单条：{"role", "content", "ts", "sender_id", "nickname", "person_id"}
+HistoryMsg = dict[str, Any]
+
 
 # ── 配置 ────────────────────────────────────────────────
 
@@ -40,10 +58,8 @@ SILICONFLOW_KEY = os.getenv("SILICONFLOW_API_KEY", "")
 SILICONFLOW_BASE = "https://api.siliconflow.cn/v1"
 EMBEDDING_MODEL = "BAAI/bge-large-zh-v1.5"
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
-RERANK_MIN_SIMILARITY: float = 0.4   # 海选分：Embedding 相似度门槛
-RERANK_MIN_RELEVANCE: float = 0.3    # 选拔分：Reranker 相关性门槛
-RERANK_MAX_CANDIDATES: int = 50    # 海选最多候选数
-RERANK_MAX_RESULTS: int = 20       # 最终结果安全上限
+RERANK_MIN_SIMILARITY: float = 0.3   # 海选分：Embedding 相似度门槛
+RERANK_MIN_RELEVANCE: float = 0.7    # 选拔分：Reranker 相关性门槛
 
 DEFAULT_BOT_NAME = os.getenv("BOT_NAME", "机器人助手")
 
@@ -90,6 +106,8 @@ os.makedirs(SESSIONS_DIR, exist_ok=True)
 SETTLE_FILE = os.path.join(os.path.dirname(__file__), "settlement_times.json")
 MEM0_LOG_FILE = os.path.join(os.path.dirname(__file__), "mem0_log.json")
 DYNAMIC_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "dynamic_prompt.txt")
+EMOTIONS_FILE = os.path.join(os.path.dirname(__file__), "emotions.json")
+EMOTION_RECENT_DAYS = 30
 LOCAL_TZ = timezone(timedelta(hours=8))  # 北京时间
 
 
@@ -115,6 +133,162 @@ def _get_settlements() -> dict[str, str]:
     return _settlement_cache
 
 
+def _load_emotions() -> EmotionData:
+    if os.path.exists(EMOTIONS_FILE):
+        try:
+            with open(EMOTIONS_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get("users"), dict):
+                data.setdefault("schema_version", 1)
+                data.setdefault("updated_at", "")
+                data.setdefault("migrated_dynamic_prompt", False)
+                return data
+        except Exception as e:
+            print(f"[Emotion] 读取失败: {e}")
+    return {"schema_version": 1, "updated_at": "", "migrated_dynamic_prompt": False, "users": {}}
+
+
+def _save_emotions(data: EmotionData) -> None:
+    data["schema_version"] = 1
+    data["updated_at"] = _now_minute()
+    data.setdefault("users", {})
+    with open(EMOTIONS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _person_id(session_id: str, sender_id: str | None, nickname: str) -> str:
+    sender = str(sender_id or nickname or "unknown").strip() or "unknown"
+    safe = sender.replace("\n", " ").replace("\r", " ")
+    return f"{session_id}:{safe}"
+
+
+def _session_rank(person_id: str, session_id: str) -> int:
+    return 0 if person_id.startswith(f"{session_id}:") else 1
+
+
+def _event_time_key(event: EmotionEvent) -> str:
+    return str(event.get("start_at") or event.get("end_at") or "")
+
+
+def _format_event(event: EmotionEvent) -> str:
+    start = str(event.get("start_at") or "未知时间")
+    end = str(event.get("end_at") or start)
+    when = start if end == start else f"{start}-{end[-5:]}"
+    text = str(event.get("event") or "").strip()
+    emotion = str(event.get("emotion") or "").strip()
+    if text and emotion:
+        return f"{when}：{text} → {emotion}"
+    return f"{when}：{text or emotion}"
+
+
+def _sort_emotion_users(users: dict[str, EmotionUser], session_id: str) -> list[tuple[str, EmotionUser]]:
+    items = list(users.items())
+    current = [it for it in items if _session_rank(it[0], session_id) == 0]
+    other = [it for it in items if _session_rank(it[0], session_id) != 0]
+    key = lambda kv: (str(kv[1].get("updated_at") or ""), 1 if kv[1].get("summary_before_30d") else 0)
+    current.sort(key=key, reverse=True)
+    other.sort(key=key, reverse=True)
+    return current + other
+
+
+def _format_emotions_for_prompt(session_id: str) -> str:
+    data = _load_emotions()
+    users = data.get("users", {})
+    if not users:
+        return ""
+
+    rows = ["| 用户 | 情感日志 |", "| --- | --- |"]
+    for pid, user in _sort_emotion_users(users, session_id):
+        display = str(user.get("display_name") or pid)
+        parts = []
+        logs = list(user.get("logs") or [])
+        logs.sort(key=_event_time_key, reverse=True)
+        for event in logs:
+            if isinstance(event, dict):
+                parts.append(_format_event(event))
+        summary = str(user.get("summary_before_30d") or "").strip()
+        if summary:
+            parts.append(f"30天前摘要：{summary}")
+        if parts:
+            rows.append(f"| {display} | {'<br>'.join(parts)} |")
+    if len(rows) == 2:
+        return ""
+    return "\n".join(rows)
+
+
+def _emotions_json() -> EmotionData:
+    data = _load_emotions()
+    data["users"] = dict(data.get("users") or {})
+    return data
+
+
+def _emotion_upsert_user(person_id: str, display_name: str, summary_before_30d: str = "") -> EmotionUser:
+    data = _load_emotions()
+    users = data.setdefault("users", {})
+    user = users.setdefault(person_id, {"display_name": display_name, "summary_before_30d": "", "logs": []})
+    user["display_name"] = display_name or user.get("display_name") or person_id
+    if summary_before_30d:
+        user["summary_before_30d"] = summary_before_30d
+    user["updated_at"] = _now_minute()
+    _save_emotions(data)
+    return user
+
+
+def _emotion_add_event(person_id: str, display_name: str, event: dict[str, Any]) -> EmotionEvent:
+    data = _load_emotions()
+    users = data.setdefault("users", {})
+    user = users.setdefault(person_id, {"display_name": display_name, "summary_before_30d": "", "logs": []})
+    user["display_name"] = display_name or user.get("display_name") or person_id
+    logs = user.setdefault("logs", [])
+    item = {
+        "start_at": str(event.get("start_at") or _now_minute()),
+        "end_at": str(event.get("end_at") or event.get("start_at") or _now_minute()),
+        "event": str(event.get("event") or "").strip(),
+        "emotion": str(event.get("emotion") or "").strip(),
+    }
+    if item["event"] or item["emotion"]:
+        logs.append(item)
+    logs.sort(key=_event_time_key, reverse=True)
+    user["updated_at"] = _now_minute()
+    _save_emotions(data)
+    return item
+
+
+def _emotion_update_event(person_id: str, index: int, event: dict[str, Any]) -> EmotionEvent:
+    data = _load_emotions()
+    user = data.get("users", {}).get(person_id)
+    if not user:
+        raise ValueError("person not found")
+    logs = user.setdefault("logs", [])
+    if index < 0 or index >= len(logs):
+        raise ValueError("event not found")
+    logs[index] = {
+        "start_at": str(event.get("start_at") or logs[index].get("start_at") or _now_minute()),
+        "end_at": str(event.get("end_at") or event.get("start_at") or logs[index].get("end_at") or _now_minute()),
+        "event": str(event.get("event") or "").strip(),
+        "emotion": str(event.get("emotion") or "").strip(),
+    }
+    logs.sort(key=_event_time_key, reverse=True)
+    user["updated_at"] = _now_minute()
+    _save_emotions(data)
+    return logs[index]
+
+
+def _emotion_delete(person_id: str, index: int | None = None) -> None:
+    data = _load_emotions()
+    users = data.setdefault("users", {})
+    if person_id not in users:
+        return
+    if index is None:
+        users.pop(person_id, None)
+    else:
+        logs = users[person_id].setdefault("logs", [])
+        if 0 <= index < len(logs):
+            logs.pop(index)
+            users[person_id]["updated_at"] = _now_minute()
+    _save_emotions(data)
+
+
 def _settlement_boundary() -> datetime:
     """返回结算边界：今天 2:00 还是昨天 2:00"""
     now = datetime.now(LOCAL_TZ)
@@ -124,14 +298,33 @@ def _settlement_boundary() -> datetime:
     return boundary
 
 
+def _now_minute() -> str:
+    return datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
+
+
+def _parse_dt(text: str | None) -> datetime | None:
+    if not text:
+        return None
+    raw = str(text).strip()
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z"):
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            pass
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
 # ── Mem0（同步操作，用锁保护） ───────────────────────────
 
 _mem0_lock: asyncio.Lock = asyncio.Lock()
 
 # Mem0 搜索日志（环形缓冲，供 /mem0 WebUI 查看）
-_mem0_log: list[dict] = []
+_mem0_log: list[dict[str, Any]] = []
 _MEM0_LOG_MAX: int = 200
-_last_mem0_diag: dict | None = None
+_last_mem0_diag: dict[str, Any] | None = None
 
 # 加载持久化日志
 if os.path.exists(MEM0_LOG_FILE):
@@ -143,25 +336,25 @@ if os.path.exists(MEM0_LOG_FILE):
 
 _memory = Memory(
     MemoryConfig(
-        llm={
-            "provider": "deepseek",
-            "config": {"model": MODEL, "api_key": DEEPSEEK_KEY},
-        },
-        embedder={
-            "provider": "openai",
-            "config": {
+        llm=LlmConfig(
+            provider="deepseek",
+            config={"model": MODEL, "api_key": DEEPSEEK_KEY},
+        ),
+        embedder=EmbedderConfig(
+            provider="openai",
+            config={
                 "model": EMBEDDING_MODEL,
                 "api_key": SILICONFLOW_KEY,
                 "openai_base_url": SILICONFLOW_BASE,
             },
-        },
-        vector_store={
-            "provider": "qdrant",
-            "config": {
+        ),
+        vector_store=VectorStoreConfig(
+            provider="qdrant",
+            config={
                 "path": os.path.join(os.path.dirname(__file__), "qdrant_data"),
                 "embedding_model_dims": 1024,
             },
-        },
+        ),
     )
 )
 
@@ -169,6 +362,56 @@ _memory = Memory(
 def _mem_delete(memory_id: str) -> None:
     """同步删记忆（在锁内调用）"""
     _memory.delete(memory_id)
+
+
+def _split_spoken_by(spoken_by: str | list | tuple | None) -> list[str]:
+    """把来源统一存成数组；字符串优先按 Python 字面量解析。"""
+    if isinstance(spoken_by, (list, tuple)):
+        parts = [str(x).strip() for x in spoken_by]
+    else:
+        text = str(spoken_by or "").strip()
+        if not text:
+            return []
+        try:
+            value = ast.literal_eval(text)
+            if isinstance(value, str):
+                parts = [value.strip()]
+            elif isinstance(value, (list, tuple)):
+                parts = [str(x).strip() for x in value]
+            else:
+                parts = [text]
+        except (SyntaxError, ValueError):
+            parts = [text]
+    return [p for p in parts if p]
+
+
+def _format_spoken_by(spoken_by: str | list | tuple | None) -> str:
+    """把来源数组格式化给提示词/日志显示。"""
+    sources = _split_spoken_by(spoken_by)
+    return "、".join(sources) if sources else "未知"
+
+
+def _mem_add(memory: str, user_id: str, spoken_by: str = "手动添加") -> dict:
+    """同步新增记忆（在锁内调用）"""
+    return _memory.add(
+        memory,
+        user_id=user_id,
+        agent_id="qq-bot",
+        infer=False,
+        metadata={"spoken_by": _split_spoken_by(spoken_by) or ["手动添加"]},
+    )
+
+
+def _mem_update(memory_id: str, memory: str, user_id: str | None = None,
+                spoken_by: str | None = None) -> dict:
+    """同步更新记忆（在锁内调用）"""
+    old = _memory.get(memory_id)
+    metadata = dict((old or {}).get("metadata") or {})
+    if user_id:
+        metadata["user_id"] = user_id
+    if spoken_by is not None:
+        metadata["spoken_by"] = _split_spoken_by(spoken_by)
+    return _memory.update(memory_id, memory, metadata=metadata)
 
 
 def _mem_get_all(user_id: str | None = None, limit: int = 500) -> list[dict]:
@@ -185,6 +428,10 @@ def _mem_get_all(user_id: str | None = None, limit: int = 500) -> list[dict]:
             items = []
             for row in (rows or []):
                 payload = getattr(row, "payload", None) or {}
+                metadata = {k: v for k, v in payload.items() if k not in {
+                    "data", "hash", "created_at", "updated_at", "id", "text_lemmatized",
+                    "user_id", "agent_id", "run_id", "actor_id", "role", "attributed_to",
+                }}
                 items.append({
                     "id": getattr(row, "id", ""),
                     "memory": payload.get("data", ""),
@@ -193,6 +440,7 @@ def _mem_get_all(user_id: str | None = None, limit: int = 500) -> list[dict]:
                     "run_id": payload.get("run_id", ""),
                     "created_at": payload.get("created_at", ""),
                     "updated_at": payload.get("updated_at", ""),
+                    "metadata": metadata,
                 })
         if isinstance(items, dict):
             items = items.get("results", [])
@@ -202,7 +450,7 @@ def _mem_get_all(user_id: str | None = None, limit: int = 500) -> list[dict]:
         return []
 
 
-def _siliconflow_rerank(query: str, documents: list[str]) -> list[dict]:
+def _siliconflow_rerank(query: str, documents: list[str]) -> list[dict[str, Any]]:
     """调硅基流动 Reranker API 重排所有文档（同步）"""
     if not documents:
         return []
@@ -225,15 +473,36 @@ def _siliconflow_rerank(query: str, documents: list[str]) -> list[dict]:
         return []
 
 
-def _mem_search(query: str, top_k: int = 10) -> dict:
+def _mem_count(filters: dict[str, Any] | None = None) -> int:
+    """返回当前过滤条件下的记忆总数，用作检索数量，避免人为截断。"""
+    try:
+        vs = _memory.vector_store
+        query_filter = vs._create_filter(filters) if filters else None
+        count = vs.client.count(
+            collection_name=vs.collection_name,
+            count_filter=query_filter,
+            exact=True,
+        )
+        return int(getattr(count, "count", 0) or 0)
+    except Exception as e:
+        print(f"[Mem0] count 异常: {e}")
+        return 0
+
+
+def _mem_search(query: str) -> dict[str, Any]:
     """跨用户检索记忆：海选(Embedding分) → 选拔(Reranker分)，双门槛全入围"""
     global _last_mem0_diag
     clean = re.sub(r"\[CQ:\w+,.*?\]", "", query).strip()
     if not clean:
         clean = query
     try:
-        # 海选：Embedding 粗筛
-        result = _memory.search(clean, filters={"user_id": "*"}, top_k=RERANK_MAX_CANDIDATES)
+        filters = {"user_id": "*"}
+        total_memories = _mem_count(filters)
+        if total_memories <= 0:
+            return {"results": []}
+
+        # 海选：Embedding 粗筛，不再设置固定候选上限，按当前记忆库总量取回。
+        result = _memory.search(clean, filters=filters, top_k=total_memories)
         items = result.get("results", [])
         if not items:
             return result
@@ -259,21 +528,55 @@ def _mem_search(query: str, top_k: int = 10) -> dict:
         rerank_results = _siliconflow_rerank(clean, docs)
 
         if not rerank_results:
-            result["results"] = qualified[:RERANK_MAX_RESULTS]
+            result["results"] = qualified
             return result
+
+        # Reranker 偶尔会返回重复 index；同一候选只保留最高分，避免 WebUI 和最终结果重复显示。
+        best_by_index: dict[int, dict[str, Any]] = {}
+        invalid_rerank_indexes = 0
+        for rr in rerank_results:
+            idx: Any = rr.get("index")
+            if idx is None:
+                invalid_rerank_indexes += 1
+                continue
+            try:
+                idx = int(idx)
+            except (TypeError, ValueError):
+                invalid_rerank_indexes += 1
+                continue
+            if not (0 <= idx < len(qualified)):
+                invalid_rerank_indexes += 1
+                continue
+
+            score = rr.get("relevance_score", 0)
+            old = best_by_index.get(idx)
+            if old is None or score > old.get("relevance_score", 0):
+                item = dict(rr)
+                item["index"] = idx
+                best_by_index[idx] = item
+
+        duplicate_rerank_indexes = len(rerank_results) - invalid_rerank_indexes - len(best_by_index)
+        if duplicate_rerank_indexes > 0:
+            print(f"[Reranker] 去重重复 index {duplicate_rerank_indexes} 条")
+
+        rerank_results = sorted(
+            best_by_index.values(),
+            key=lambda rr: rr.get("relevance_score", 0),
+            reverse=True,
+        )
 
         # 双门槛：Reranker 分 ≥ 选拔分 的才入围
         final = []
         failed = []
         for rr in rerank_results:
-            score = rr.get("relevance_score", 0)
-            idx = rr.get("index")
-            if idx is None or not (0 <= idx < len(qualified)):
+            score: float = float(rr.get("relevance_score", 0))
+            ri: int = int(rr.get("index", -1))
+            if ri < 0 or ri >= len(qualified):
                 continue
             if score < RERANK_MIN_RELEVANCE:
-                failed.append((score, qualified[idx].get("memory", "")[:30]))
+                failed.append((score, qualified[ri].get("memory", "")[:30]))
                 continue
-            item = dict(qualified[idx])
+            item = dict(qualified[ri])
             item["score"] = score
             final.append(item)
 
@@ -286,11 +589,6 @@ def _mem_search(query: str, top_k: int = 10) -> dict:
             print(f"[Reranker] 选拔淘汰 {len(failed)} 条 (<{RERANK_MIN_RELEVANCE}):")
             for s, txt in failed[:5]:
                 print(f"  [{s:.3f}] {txt}...")
-
-        # 安全上限
-        if len(final) > RERANK_MAX_RESULTS:
-            print(f"[Reranker] 结果超上限，截断 ({len(final)} → {RERANK_MAX_RESULTS})")
-            final = final[:RERANK_MAX_RESULTS]
 
         result["results"] = final
 
@@ -308,17 +606,25 @@ def _mem_search(query: str, top_k: int = 10) -> dict:
             "rerank_max": round(max(all_rerank), 3) if all_rerank else 0,
             "passed": len(final),
             "dropped_rerank": len(failed),
+            "deduped_rerank": duplicate_rerank_indexes,
+            "invalid_rerank_indexes": invalid_rerank_indexes,
             "emb_candidates": [{
+                "id": item.get("id", ""),
                 "memory": item.get("memory", "")[:80],
                 "score": round(item.get("score", 0), 3),
                 "passed": item.get("score", 0) >= RERANK_MIN_SIMILARITY,
             } for item in items],
-            "rerank_candidates": [{
-                "memory": qualified[idx].get("memory", "")[:80] if 0 <= idx < len(qualified) else "",
-                "rerank_score": round(rr.get("relevance_score", 0), 3),
-                "emb_score": round(qualified[idx].get("score", 0), 3) if 0 <= idx < len(qualified) else 0,
-                "passed": rr.get("relevance_score", 0) >= RERANK_MIN_RELEVANCE,
-            } for rr in rerank_results if (rr.get("index") is not None and 0 <= rr["index"] < len(qualified))],
+            "rerank_candidates": [
+                {
+                    "id": qualified[ri2].get("id", ""),
+                    "memory": qualified[ri2].get("memory", "")[:80],
+                    "rerank_score": round(rr.get("relevance_score", 0), 3),
+                    "emb_score": round(qualified[ri2].get("score", 0), 3),
+                    "passed": rr.get("relevance_score", 0) >= RERANK_MIN_RELEVANCE,
+                }
+                for rr in rerank_results
+                if 0 <= (ri2 := int(rr.get("index", -1))) < len(qualified)
+            ],
         }
         return result
     except Exception as e:
@@ -358,40 +664,60 @@ SUMMARY_PROMPT = (
     "忽略：角色扮演、即兴吐槽、开发调试、网络抱怨等临时话题。\n"
     "只保留：真实姓名/昵称/身份、个人偏好/技能/经历、群内约定或共识。\n"
     "\n"
-    "每条事实按「主语 + 谓语 + 宾语」结构输出，一行一条，不要编号。\n"
-    "示例：「张三喜欢打篮球」「李四在字节跳动工作」「王五叫老王」。\n"
-    "如果事实有歧义或归属不清，宁可不输出。没有值得记住的事就输出空。"
+    "每条事实按「来源列表<TAB>事实」输出，一行一条，不要编号。\n"
+    "来源列表必须使用 Python 列表字面量语法，例如 [\"张三\", \"李四\"]；即使只有一个来源，也要写成 [\"张三\"]。\n"
+    "来源必须是这条事实在对话中的具体说话人昵称；如果事实来自多人共同确认，就把多个人都放进列表。\n"
+    "来源昵称里的双引号必须转义成 \\\"，反斜杠必须转义成 \\\\。\n"
+    "事实按「主语 + 谓语 + 宾语」结构输出。\n"
+    "示例：「[\"张三\"]\t张三喜欢打篮球」「[\"李四\", \"王五\"]\t李四和王五都确认周六聚餐」。\n"
+    "如果事实有歧义、归属不清或无法确定来源，宁可不输出。没有值得记住的事就输出空。"
 )
+
+# 提示词不要影响模型的发挥，限制性提示词想到的话先放注释里防止忘记。出问题了再考虑加限制。
 
 DIARY_PROMPT = (
     "你将看到一段 QQ 群聊对话。假设你是第六谷绫本人，回顾昨天发生了什么。\n"
     "\n"
     "请按以下格式输出（尖括号标记不要省略）：\n"
     "<日记>\n"
-    "用「昨天」开头写一段心情日记，记录昨天感觉怎么样、跟谁聊了什么、有没有让你在意的事。不超过 200 字。\n"
+    "用「昨天」开头写一段心情日记，记录昨天感觉怎么样、跟谁聊了什么、有没有让你在意的事。不限字数。\n"
     "例如「昨天哥跟我说了服务器的事」「菜鸟又在摸鱼」。\n"
-    "</日记>\n"
-    "<情感>\n"
-    "列出昨天参与对话的每个人，以及你对他们当前的情感态度。\n"
-    "用 Markdown 表格：第一列是「群昵称（QQ昵称）」——群昵称是他们在群里显示的名字，括号里是他们的 QQ 账号昵称。不要用绰号。第二列是情感描述（一句话）。\n"
-    "格式：\n"
-    "| 名称 | 情感 |\n"
-    "| --- | --- |\n"
-    "| A的群昵称（A的QQ昵称）| 亲近、有点担心 |\n"
-    "没有明确互动的群友不要列。</情感>"
+    "</日记>"
+)
+
+EMOTION_PROMPT = (
+    "你是第六谷绫。请根据已有情感记忆和昨天 QQ 群聊，更新你对群友的情感事件日志。\n"
+    "输出 JSON 数组。每个元素代表一个用户：person_id、display_name、events。\n"
+    "events 里每条包含 start_at、end_at、event、emotion。时间使用对话记录里的时分。\n"
+    "一天内同一用户可以有多条事件。"
+)
+# 可按需加入但先不限制模型发挥：只输出真实影响情感的互动；不要把不同情感方向强行合并；
+# 没有明显变化时由模型判断是否记录；start_at/end_at 分别取相关消息第一条和最后一条时间。
+
+EMOTION_REPAIR_PROMPT = "把下面内容修成合法 JSON 数组，只输出 JSON。"
+
+EMOTION_ROLLUP_PROMPT = (
+    "把旧的长期摘要和 30 天外情感日志压缩成新的长期摘要。"
+    "保留稳定印象和关键事件，输出一段中文。"
 )
 
 
-async def _call_deepseek_for_settle(system_prompt: str, history: list[dict], tag: str) -> str | None:
-    """结算辅助：从历史中提取用户消息 → 调 DeepSeek → 返回响应文本"""
+def _history_text(history: list[HistoryMsg]) -> str:
     user_msgs = [h for h in history if h["role"] == "user"]
-    if not user_msgs:
-        return None
+    lines = []
+    for h in user_msgs:
+        content = h.get("content", "")
+        ts = h.get("ts")
+        if ts:
+            lines.append(f"[{ts}] {content}")
+        else:
+            lines.append(content)
+    return "\n".join(lines)
 
-    text = "\n".join(h["content"] for h in user_msgs)
-    if len(text) < 50:
-        return None
 
+async def _call_deepseek_text(system_prompt: str, text: str, tag: str) -> str | None:
+    if len(text.strip()) < 50:
+        return None
     try:
         headers = {"Authorization": f"Bearer {DEEPSEEK_KEY}"}
         async with httpx.AsyncClient(timeout=60) as client:
@@ -412,30 +738,191 @@ async def _call_deepseek_for_settle(system_prompt: str, history: list[dict], tag
         return None
 
 
-async def _summarize_and_store(history: list[dict], user_id: str) -> None:
+async def _call_deepseek_for_settle(system_prompt: str, history: list[HistoryMsg], tag: str) -> str | None:
+    """结算辅助：从历史中提取用户消息 → 调 DeepSeek → 返回响应文本"""
+    text = _history_text(history)
+    return await _call_deepseek_text(system_prompt, text, tag)
+
+
+def _extract_json_array(text: str) -> list[Any] | None:
+    raw = text.strip()
+    try:
+        value = json.loads(raw)
+        return value if isinstance(value, list) else None
+    except json.JSONDecodeError:
+        pass
+    start = raw.find("[")
+    end = raw.rfind("]")
+    if start >= 0 and end > start:
+        try:
+            value = json.loads(raw[start:end + 1])
+            return value if isinstance(value, list) else None
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+async def _json_array_with_repair(text: str, tag: str) -> list[Any] | None:
+    current = text
+    for attempt in range(5):
+        value = _extract_json_array(current)
+        if value is not None:
+            return value
+        repaired = await _call_deepseek_text(EMOTION_REPAIR_PROMPT, current, f"{tag}Repair{attempt + 1}")
+        if not repaired:
+            return None
+        current = repaired
+    print(f"[{tag}] JSON 修复超过上限，跳过写入")
+    return None
+
+
+async def _rollup_emotion_user(user: EmotionUser) -> None:
+    logs = [e for e in user.get("logs", []) if isinstance(e, dict)]
+    cutoff = datetime.now(LOCAL_TZ) - timedelta(days=EMOTION_RECENT_DAYS)
+    recent = []
+    expired = []
+    for event in logs:
+        dt = _parse_dt(event.get("start_at") or event.get("end_at"))
+        if dt and dt.tzinfo is None:
+            dt = dt.replace(tzinfo=LOCAL_TZ)
+        if dt and dt < cutoff:
+            expired.append(event)
+        else:
+            recent.append(event)
+    if not expired:
+        user["logs"] = sorted(recent, key=_event_time_key, reverse=True)
+        return
+
+    old_summary = str(user.get("summary_before_30d") or "")
+    expired_text = "\n".join(_format_event(e) for e in sorted(expired, key=_event_time_key))
+    text = f"旧摘要：{old_summary}\n\n过期日志：\n{expired_text}"
+    summary = await _call_deepseek_text(EMOTION_ROLLUP_PROMPT, text, "EmotionRollup")
+    user["summary_before_30d"] = (summary or old_summary or expired_text).strip()
+    user["logs"] = sorted(recent, key=_event_time_key, reverse=True)
+
+
+def _migrate_dynamic_prompt_emotions(session_id: str) -> None:
+    data = _load_emotions()
+    if data.get("migrated_dynamic_prompt"):
+        return
+    if not os.path.exists(DYNAMIC_PROMPT_FILE):
+        data["migrated_dynamic_prompt"] = True
+        _save_emotions(data)
+        return
+
+    with open(DYNAMIC_PROMPT_FILE, encoding="utf-8") as f:
+        old = f.read()
+    marker = "=== 昨日情感 ==="
+    if marker not in old:
+        data["migrated_dynamic_prompt"] = True
+        _save_emotions(data)
+        return
+
+    users = data.setdefault("users", {})
+    table = old.split(marker, 1)[1].strip()
+    for line in table.splitlines():
+        line = line.strip()
+        if not line.startswith("|") or "---" in line or "名称" in line:
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if len(cells) < 2 or not cells[0] or not cells[1]:
+            continue
+        display = cells[0]
+        pid = _person_id(session_id, None, display)
+        user = users.setdefault(pid, {"display_name": display, "summary_before_30d": "", "logs": []})
+        user["display_name"] = display
+        summary = str(user.get("summary_before_30d") or "").strip()
+        migrated = f"旧动态情感迁移：{cells[1]}"
+        user["summary_before_30d"] = f"{summary}\n{migrated}".strip() if summary else migrated
+        user["updated_at"] = _now_minute()
+    data["migrated_dynamic_prompt"] = True
+    _save_emotions(data)
+
+
+async def _update_emotions(history: list[HistoryMsg], session_id: str) -> None:
+    _migrate_dynamic_prompt_emotions(session_id)
+    text = _history_text(history)
+    if not text:
+        return
+    existing = _format_emotions_for_prompt(session_id)
+    payload = f"<已有情感记忆>\n{existing or '（无）'}\n</已有情感记忆>\n\n<昨天群聊记录>\n{text}\n</昨天群聊记录>"
+    result = await _call_deepseek_text(EMOTION_PROMPT, payload, "Emotion")
+    if not result:
+        return
+    updates = await _json_array_with_repair(result, "Emotion")
+    if updates is None:
+        return
+
+    data = _load_emotions()
+    users = data.setdefault("users", {})
+    for item in updates:
+        if not isinstance(item, dict):
+            continue
+        display = str(item.get("display_name") or "").strip()
+        pid = str(item.get("person_id") or "").strip()
+        if not pid:
+            pid = _person_id(session_id, item.get("sender_id"), display)
+        if not display:
+            display = pid
+        user = users.setdefault(pid, {"display_name": display, "summary_before_30d": "", "logs": []})
+        user["display_name"] = display
+        logs = user.setdefault("logs", [])
+        for event in item.get("events") or []:
+            if not isinstance(event, dict):
+                continue
+            entry = {
+                "start_at": str(event.get("start_at") or _now_minute()),
+                "end_at": str(event.get("end_at") or event.get("start_at") or _now_minute()),
+                "event": str(event.get("event") or "").strip(),
+                "emotion": str(event.get("emotion") or "").strip(),
+            }
+            if entry["event"] or entry["emotion"]:
+                logs.append(entry)
+        logs.sort(key=_event_time_key, reverse=True)
+        user["updated_at"] = _now_minute()
+        await _rollup_emotion_user(user)
+    _save_emotions(data)
+    print(f"[Emotion] {session_id}: 更新 {len(updates)} 个用户")
+
+
+async def _summarize_and_store(history: list[HistoryMsg], user_id: str) -> None:
     """取出未结算对话 → DeepSeek 摘要 → memory.add()"""
     summary = await _call_deepseek_for_settle(SUMMARY_PROMPT, history, "Settle")
     if not summary:
         return
 
-    facts = [line.strip() for line in summary.split("\n") if line.strip()]
-    if not facts:
+    entries: list[tuple[list[str], str]] = []
+    for line in summary.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if "\t" in line:
+            spoken_by_text, fact = line.split("\t", 1)
+        else:
+            spoken_by_text, fact = "每日结算", line
+        sources = _split_spoken_by(spoken_by_text) or ["每日结算"]
+        fact = fact.strip()
+        if fact:
+            entries.append((sources, fact))
+    if not entries:
         return
 
     # 逐条存入 Mem0
-    for fact in facts:
+    stored_facts: list[str] = []
+    for sources, fact in entries:
         try:
             async with _mem0_lock:
                 _memory.add(
                     fact, user_id=user_id, agent_id="qq-bot",
-                    infer=False, metadata={"spoken_by": "每日结算"},
+                    infer=False, metadata={"spoken_by": sources},
                 )
+            stored_facts.append(fact)
         except Exception as e:
             print(f"[Settle] 存入失败: {e}")
-    print(f"[Settle] {user_id}: 结算 {len(facts)} 条 → {facts}")
+    print(f"[Settle] {user_id}: 结算 {len(stored_facts)} 条 → {stored_facts}")
 
 
-async def _update_dynamic_prompt(history: list[dict]) -> None:
+async def _update_dynamic_prompt(history: list[HistoryMsg]) -> None:
     """第二次 DeepSeek 调用：写日记 → 更新 dynamic_prompt.txt"""
     diary = await _call_deepseek_for_settle(DIARY_PROMPT, history, "DynamicPrompt")
     if not diary:
@@ -464,7 +951,7 @@ async def _update_dynamic_prompt(history: list[dict]) -> None:
     print(f"[DynamicPrompt] 日记已更新: {diary_text[:80]}...")
 
 
-async def check_and_settle(user_id: str, history: list[dict]) -> None:
+async def check_and_settle(user_id: str, history: list[HistoryMsg]) -> None:
     """如果需要结算，取出未结算对话，摘要并存库，然后清空旧历史"""
     boundary = _settlement_boundary()
     boundary_str = boundary.isoformat()
@@ -475,9 +962,10 @@ async def check_and_settle(user_id: str, history: list[dict]) -> None:
     if last >= boundary_str:
         return  # 已结算
 
-    # 结算：摘要全部历史 → 存库 → 更新动态提示词
+    # 结算：摘要全部历史 → 存库 → 更新动态提示词/情感日志
     await _summarize_and_store(history, user_id)
     await _update_dynamic_prompt(history)
+    await _update_emotions(history, user_id)
 
     # 清空历史，新一天从头开始
     history.clear()
@@ -498,7 +986,7 @@ def _session_path(user_id: str) -> str:
     return os.path.join(SESSIONS_DIR, f"{safe}.json")
 
 
-def load_history(user_id: str) -> list[dict]:
+def load_history(user_id: str) -> list[HistoryMsg]:
     path = _session_path(user_id)
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
@@ -506,15 +994,15 @@ def load_history(user_id: str) -> list[dict]:
     return []
 
 
-def save_history(user_id: str, history: list[dict]) -> None:
+def save_history(user_id: str, history: list[HistoryMsg]) -> None:
     with open(_session_path(user_id), "w", encoding="utf-8") as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
 
 
-_history_cache: dict[str, list[dict]] = {}
+_history_cache: dict[str, list[HistoryMsg]] = {}
 
 
-def get_history(user_id: str) -> list[dict]:
+def get_history(user_id: str) -> list[HistoryMsg]:
     if user_id not in _history_cache:
         _history_cache[user_id] = load_history(user_id)
     return _history_cache[user_id]
@@ -579,7 +1067,7 @@ TOOLS = [
 ]
 
 
-async def handle_tool_calls(msg: dict) -> tuple[bool, list[dict]]:
+async def handle_tool_calls(msg: dict[str, Any]) -> tuple[bool, list[dict[str, Any]]]:
     """解析模型返回的所有工具调用
     返回: (是否引用, [工具响应消息列表])
     """
@@ -626,17 +1114,17 @@ async def handle_tool_calls(msg: dict) -> tuple[bool, list[dict]]:
 # ── 记忆检索（滚雪球） ──────────────────────────────────
 
 
-async def search_memories(query: str, max_rounds: int = 2, top_k: int = 10,
-                          capture: bool = False, user_ctx: dict | None = None) -> list[dict]:
-    """滚雪球记忆检索，直到 id 集合闭合或超限"""
+async def search_memories(query: str, max_rounds: int = 2,
+                          capture: bool = False, user_ctx: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """滚雪球记忆检索，直到 id 集合闭合或达到最大轮数"""
     global _last_mem0_diag
-    known: dict[str, dict] = {}
-    q = query
-    rounds_diag: list[dict] = []
+    known: dict[str, dict[str, Any]] = {}
+    q: str = query
+    rounds_diag: list[dict[str, Any]] = []
 
     for _ in range(max_rounds):
         async with _mem0_lock:
-            result = _mem_search(q, top_k=top_k)
+            result = _mem_search(q)
 
         # 捕获本轮诊断
         if capture:
@@ -673,7 +1161,7 @@ async def search_memories(query: str, max_rounds: int = 2, top_k: int = 10,
             if not m or not isinstance(m, dict):
                 continue
             meta = m.get("metadata") or {}
-            spoken_by = meta.get("spoken_by", "未知")
+            spoken_by = _format_spoken_by(meta.get("spoken_by", "未知"))
             parts.append(f"[{spoken_by}] {m.get('memory', '')}")
         q = "\n".join(parts)
         # 限制 query 长度，避免超过 Mem0 的 512 token 限制
@@ -704,9 +1192,9 @@ async def search_memories(query: str, max_rounds: int = 2, top_k: int = 10,
 # ── 矛盾检测 ────────────────────────────────────────────
 
 
-def detect_conflicts(memories: list[dict]) -> list[str]:
+def detect_conflicts(memories: list[dict[str, Any]]) -> list[str]:
     """检测同主题不同 spoken_by 的矛盾记忆"""
-    by_topic: dict[str, list[dict]] = {}
+    by_topic: dict[str, list[dict[str, Any]]] = {}
     for m in memories:
         if not m or not isinstance(m, dict):
             continue
@@ -715,7 +1203,11 @@ def detect_conflicts(memories: list[dict]) -> list[str]:
 
     warnings = []
     for items in by_topic.values():
-        speakers = {(it.get("metadata") or {}).get("spoken_by", "?") for it in items}
+        speakers = {
+            source
+            for it in items
+            for source in _split_spoken_by((it.get("metadata") or {}).get("spoken_by", "?"))
+        }
         if len(speakers) > 1 and len(items) > 1:
             ids = [it["id"] for it in items]
             warnings.append(
@@ -724,14 +1216,14 @@ def detect_conflicts(memories: list[dict]) -> list[str]:
     return warnings
 
 
-def format_memories(memories: list[dict]) -> str:
+def format_memories(memories: list[dict[str, Any]]) -> str:
     """格式化记忆列表"""
     lines = []
     for m in memories:
         if not m or not isinstance(m, dict):
             continue
         meta = m.get("metadata") or {}
-        spoken_by = meta.get("spoken_by", "未知")
+        spoken_by = _format_spoken_by(meta.get("spoken_by", "未知"))
         created = str(m.get("created_at", ""))[:10]
         lines.append(f"[{m.get('id', '?')}] [{spoken_by}] {m.get('memory', '')}（{created}）")
     return "\n".join(lines)
@@ -742,13 +1234,14 @@ def format_memories(memories: list[dict]) -> str:
 
 async def call_deepseek(
     user_id: str, nickname: str, message: str, is_direct: bool, bot_name: str = "",
-    group_info: dict | None = None, mentioned: bool = False, gender: str = "",
+    group_info: dict[str, Any] | None = None, mentioned: bool = False, gender: str = "",
+    sender_id: str = "", message_time: str = "",
 ) -> list[tuple[str, bool]]:
     bot_name = bot_name or DEFAULT_BOT_NAME
     history = get_history(user_id)
 
     # 1. 记忆检索
-    memories: list[dict] = []
+    memories: list[dict[str, Any]] = []
     try:
         memories = await search_memories(message, capture=True,
             user_ctx={"nickname": nickname, "message": message, "user_id": user_id})
@@ -779,6 +1272,9 @@ async def call_deepseek(
             f"\n群主：{owner}"
             f"\n管理员：{', '.join(admins) if admins else '无'}"
         )
+    emotions_text = _format_emotions_for_prompt(user_id)
+    if emotions_text:
+        system += "\n\n=== 情感记忆 ===\n" + emotions_text
     if memories_text:
         system += "\n\n相关长期记忆：\n" + memories_text
     if conflict_warnings:
@@ -856,9 +1352,17 @@ async def call_deepseek(
         final_replies.append((stripped, qt))
 
     # 5. 保存对话历史
-    history.append({"role": "user", "content": f"<{nickname}> {message}"})
+    ts = message_time or _now_minute()
+    history.append({
+        "role": "user",
+        "content": f"<{nickname}> {message}",
+        "ts": ts,
+        "sender_id": sender_id,
+        "nickname": nickname,
+        "person_id": _person_id(user_id, sender_id, nickname),
+    })
     for rep, _ in final_replies:
-        history.append({"role": "assistant", "content": f"<{bot_name}> {rep}"})
+        history.append({"role": "assistant", "content": f"<{bot_name}> {rep}", "ts": _now_minute()})
     save_history(user_id, history)
 
     # 6. 每日结算记忆（在回复前同步执行）
@@ -881,11 +1385,13 @@ async def chat(request: web.Request) -> web.Response:
     is_direct = body.get("is_direct", True)
     mentioned = body.get("mentioned", False)
     gender = body.get("gender", "")
+    sender_id = body.get("sender_id", "")
+    message_time = body.get("message_time", "")
 
     bot_name = body.get("bot_name", "")
     group_info = body.get("group_info")
     try:
-        replies = await call_deepseek(user_id, nickname, message, is_direct, bot_name, group_info, mentioned, gender)
+        replies = await call_deepseek(user_id, nickname, message, is_direct, bot_name, group_info, mentioned, gender, sender_id, message_time)
     except Exception as e:
         traceback.print_exc()
         return web.json_response({"replies": [{"reply": f"出错了：{e}", "quote": False}]})
@@ -903,9 +1409,17 @@ _webui_ctx = {
     "_mem0_log": _mem0_log,
     "_mem0_lock": _mem0_lock,
     "_mem_get_all": _mem_get_all,
+    "_mem_add": _mem_add,
+    "_mem_update": _mem_update,
     "_mem_delete": _mem_delete,
+    "_emotions_json": _emotions_json,
+    "_emotion_upsert_user": _emotion_upsert_user,
+    "_emotion_add_event": _emotion_add_event,
+    "_emotion_update_event": _emotion_update_event,
+    "_emotion_delete": _emotion_delete,
     "_summarize_and_store": _summarize_and_store,
     "_update_dynamic_prompt": _update_dynamic_prompt,
+    "_update_emotions": _update_emotions,
     "get_history": get_history,
     "save_history": save_history,
     "SESSIONS_DIR": SESSIONS_DIR,

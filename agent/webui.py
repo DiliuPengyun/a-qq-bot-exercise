@@ -59,6 +59,39 @@ def setup_routes(app: web.Application, ctx: dict) -> None:
             items = get_all(user_id=uid)
         return web.json_response(items)
 
+    async def memories_add(request: web.Request) -> web.Response:
+        body = await request.json()
+        memory = (body.get("memory") or "").strip()
+        user_id = (body.get("user_id") or "manual").strip()
+        spoken_by = (body.get("spoken_by") or "手动添加").strip()
+        if not memory:
+            return web.json_response({"status": "error", "reason": "empty memory"})
+        if not user_id:
+            return web.json_response({"status": "error", "reason": "empty user_id"})
+        lock = ctx["_mem0_lock"]
+        add_fn = ctx["_mem_add"]
+        async with lock:
+            result = add_fn(memory, user_id, spoken_by)
+        return web.json_response({"status": "ok", "result": result})
+
+    async def memories_update(request: web.Request) -> web.Response:
+        body = await request.json()
+        mid = body.get("id", "")
+        memory = (body.get("memory") or "").strip()
+        user_id = (body.get("user_id") or "").strip()
+        spoken_by = (body.get("spoken_by") or "").strip()
+        if not mid:
+            return web.json_response({"status": "error", "reason": "no id"})
+        if not memory:
+            return web.json_response({"status": "error", "reason": "empty memory"})
+        if not user_id:
+            return web.json_response({"status": "error", "reason": "empty user_id"})
+        lock = ctx["_mem0_lock"]
+        update_fn = ctx["_mem_update"]
+        async with lock:
+            result = update_fn(mid, memory, user_id, spoken_by)
+        return web.json_response({"status": "ok", "result": result})
+
     async def memories_delete(request: web.Request) -> web.Response:
         body = await request.json()
         mid = body.get("id", "")
@@ -68,6 +101,49 @@ def setup_routes(app: web.Application, ctx: dict) -> None:
         delete_fn = ctx["_mem_delete"]
         async with lock:
             delete_fn(mid)
+        return web.json_response({"status": "ok"})
+
+    async def emotions_page(request: web.Request) -> web.Response:
+        return web.Response(text=_page("emotions.html"), content_type="text/html")
+
+    async def emotions_json(request: web.Request) -> web.Response:
+        return web.json_response(ctx["_emotions_json"]())
+
+    async def emotions_user_upsert(request: web.Request) -> web.Response:
+        body = await request.json()
+        person_id = (body.get("person_id") or "").strip()
+        display_name = (body.get("display_name") or person_id).strip()
+        summary = (body.get("summary_before_30d") or "").strip()
+        if not person_id:
+            return web.json_response({"status": "error", "reason": "no person_id"})
+        result = ctx["_emotion_upsert_user"](person_id, display_name, summary)
+        return web.json_response({"status": "ok", "result": result})
+
+    async def emotions_event_add(request: web.Request) -> web.Response:
+        body = await request.json()
+        person_id = (body.get("person_id") or "").strip()
+        display_name = (body.get("display_name") or person_id).strip()
+        if not person_id:
+            return web.json_response({"status": "error", "reason": "no person_id"})
+        result = ctx["_emotion_add_event"](person_id, display_name, body)
+        return web.json_response({"status": "ok", "result": result})
+
+    async def emotions_event_update(request: web.Request) -> web.Response:
+        body = await request.json()
+        person_id = (body.get("person_id") or "").strip()
+        index = int(body.get("index", -1))
+        if not person_id:
+            return web.json_response({"status": "error", "reason": "no person_id"})
+        result = ctx["_emotion_update_event"](person_id, index, body)
+        return web.json_response({"status": "ok", "result": result})
+
+    async def emotions_delete(request: web.Request) -> web.Response:
+        body = await request.json()
+        person_id = (body.get("person_id") or "").strip()
+        index = body.get("index")
+        if not person_id:
+            return web.json_response({"status": "error", "reason": "no person_id"})
+        ctx["_emotion_delete"](person_id, int(index) if index is not None else None)
         return web.json_response({"status": "ok"})
 
     async def force_settle(request: web.Request) -> web.Response:
@@ -93,5 +169,13 @@ def setup_routes(app: web.Application, ctx: dict) -> None:
     app.router.add_get("/mem0", mem0_page)
     app.router.add_get("/memories", memories_page)
     app.router.add_get("/memories-json", memories_json)
+    app.router.add_post("/memories/add", memories_add)
+    app.router.add_post("/memories/update", memories_update)
     app.router.add_post("/memories/delete", memories_delete)
+    app.router.add_get("/emotions", emotions_page)
+    app.router.add_get("/emotions-json", emotions_json)
+    app.router.add_post("/emotions/user", emotions_user_upsert)
+    app.router.add_post("/emotions/event/add", emotions_event_add)
+    app.router.add_post("/emotions/event/update", emotions_event_update)
+    app.router.add_post("/emotions/delete", emotions_delete)
     app.router.add_post("/settle", force_settle)

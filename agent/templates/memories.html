@@ -5,39 +5,116 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>所有记忆</title>
 <style>
-body { font-family: system-ui; max-width: 1000px; margin: 1rem auto; padding: 0 1rem; background: #1a1a2e; color: #e0e0e0; }
+body { font-family: system-ui; max-width: 1100px; margin: 1rem auto; padding: 0 1rem; background: #1a1a2e; color: #e0e0e0; }
 nav a { color: #7ec8e3; margin-right: 1rem; text-decoration: none; font-size: .85rem; }
 nav a:hover { color: #ff6b9d; }
 h1 { color: #ff6b9d; font-size: 1.2rem; }
 table { width: 100%; border-collapse: collapse; font-size: .8rem; }
-th, td { padding: .3rem .5rem; border-bottom: 1px solid #333; text-align: left; max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+th, td { padding: .3rem .5rem; border-bottom: 1px solid #333; text-align: left; max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 th { color: #aaa; }
 tr:hover { background: #16213e; }
-button { background: #ff6b6b; color: #fff; border: none; padding: .2rem .5rem; border-radius: 3px; cursor: pointer; font-size: .7rem; }
-input, select { padding: .3rem; border-radius: 4px; border: 1px solid #333; background: #0f3460; color: #fff; }
+tr.edit-row:hover { background: transparent; }
+button { background: #ff6b6b; color: #fff; border: none; padding: .25rem .55rem; border-radius: 3px; cursor: pointer; font-size: .72rem; margin-right: .25rem; }
+button:hover { filter: brightness(1.12); }
+button.primary { background: #4ecca3; }
+button.secondary { background: #7ec8e3; }
+button.ghost { background: #444; }
+button.warn { background: #d29922; }
+input, select, textarea { padding: .35rem; border-radius: 4px; border: 1px solid #333; background: #0f3460; color: #fff; }
 input { width: 200px; }
+.nav { margin-bottom: 1rem; }
+.filters { margin: .5rem 0; }
+.id-cell { font-family: monospace; font-size: .7rem; }
+.edit-actions { margin-top: .45rem; }
+textarea { width: 100%; min-height: 70px; resize: vertical; font-family: inherit; }
+label { display: block; color: #aaa; font-size: .75rem; margin-bottom: .2rem; }
+.card { background: #16213e; border: 1px solid #333; border-radius: 6px; padding: .75rem; margin: .7rem 0; }
+.form-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: .6rem; align-items: end; margin-bottom: .6rem; }
+.edit-box { background: #0f3460; border: 1px solid #333; border-radius: 6px; padding: .65rem; margin: .35rem 0; }
+.edit-meta { display: grid; grid-template-columns: 1fr 1fr; gap: .5rem; margin-bottom: .45rem; }
+.edit-meta input { width: 100%; }
+.pill { background: #16213e; color: #aaa; border: 1px solid #333; border-radius: 10px; padding: .1rem .45rem; font-family: monospace; font-size: .7rem; }
 .muted { color: #888; font-size: .75rem; }
+.ops { min-width: 150px; }
+.status { margin-left: .5rem; }
+.ok { color: #4ecca3; }
+.err { color: #ff6b6b; }
+@media (max-width: 700px) { .form-row { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
-<nav style="margin-bottom:1rem"><a href="/">🏠 首页</a> <a href="/admin">💻 控制台</a> <a href="/mem0">🔍 Mem0日志</a> <a href="/memories">🧠 记忆库</a></nav>
+<nav class="nav"><a href="/">🏠 首页</a> <a href="/admin">💻 控制台</a> <a href="/mem0">🔍 Mem0日志</a> <a href="/memories">🧠 记忆库</a> <a href="/emotions">💗 情感记忆</a></nav>
 <h1>🧠 记忆库 <span class="muted" id="count"></span></h1>
-<div style="margin:.5rem 0">
-  <input id="filter" placeholder="搜索记忆..." oninput="render()">
-  <select id="uidFilter" onchange="render()"><option value="">全部用户</option></select>
+
+<div class="card">
+  <div class="form-row">
+    <div>
+      <label for="newUserId">user_id</label>
+      <input id="newUserId" placeholder="例如 group_xxx / manual" value="manual">
+    </div>
+    <div>
+      <label for="newSpokenBy">spoken_by</label>
+      <input id="newSpokenBy" placeholder="例如 [&quot;张三&quot;, &quot;李四&quot;]" value="手动添加">
+    </div>
+    <button type="button" class="primary" onclick="addMemory()">新增记忆</button>
+  </div>
+  <label for="newMemory">记忆内容</label>
+  <textarea id="newMemory" placeholder="输入要写入记忆库的事实，例如：小明喜欢打篮球"></textarea>
+  <span class="muted status" id="status"></span>
+</div>
+
+<div class="filters">
+  <input id="filter" placeholder="搜索记忆..." oninput="render()" aria-label="搜索记忆">
+  <select id="uidFilter" title="按用户过滤" aria-label="按用户过滤" onchange="render()"><option value="">全部用户</option></select>
 </div>
 <table id="tbl"></table>
 <script>
 let allData = [];
+let editingId = '';
+let pendingDeleteId = '';
+
+function esc(s) {
+    return String(s || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function jsStr(s) {
+    return String(s || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
+function setStatus(text, ok) {
+    let el = document.getElementById('status');
+    el.textContent = text || '';
+    el.className = 'muted status ' + (ok ? 'ok' : 'err');
+}
+
+async function api(url, body) {
+    let r = await fetch(url, {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(body),
+    });
+    let data = await r.json();
+    if (!r.ok || data.status !== 'ok') throw new Error(data.reason || ('HTTP ' + r.status));
+    return data;
+}
+
 async function load() {
     let r = await fetch('/memories-json');
     allData = await r.json();
+    let old = document.getElementById('uidFilter').value;
     let sel = document.getElementById('uidFilter');
     let uids = [...new Set(allData.map(m => m.user_id || '-'))].sort();
     sel.innerHTML = '<option value="">全部用户</option>';
     uids.forEach(u => { let o = document.createElement('option'); o.value = u; o.textContent = u; sel.appendChild(o); });
+    sel.value = old;
     render();
 }
+
 function render() {
     let f = document.getElementById('filter').value.toLowerCase();
     let u = document.getElementById('uidFilter').value;
@@ -47,20 +124,106 @@ function render() {
         return true;
     });
     document.getElementById('count').textContent = '共 ' + data.length + ' 条';
-    let html = '<tr><th>ID</th><th>内容</th><th>用户</th><th>操作</th></tr>';
+    let html = '<tr><th>ID</th><th>内容</th><th>用户</th><th>来源</th><th>操作</th></tr>';
     data.forEach(m => {
-        html += '<tr><td style="font-family:monospace;font-size:.7rem">' + (m.id||'').slice(0,12) + '</td>';
-        html += '<td title="' + (m.memory||'').replace(/"/g,'&quot;') + '">' + (m.memory||'').slice(0,80) + '</td>';
-        html += '<td>' + (m.user_id||'-').slice(-16) + '</td>';
-        html += '<td><button onclick="del(\'' + m.id + '\')">删除</button></td></tr>';
+        let rawSpokenBy = (m.metadata && m.metadata.spoken_by) || '';
+        let spokenBy = Array.isArray(rawSpokenBy) ? rawSpokenBy.join('、') : rawSpokenBy;
+        let id = m.id || '';
+        html += '<tr><td class="id-cell" title="' + esc(id) + '">' + esc(id.slice(0,12)) + '</td>';
+        html += '<td title="' + esc(m.memory) + '">' + esc((m.memory||'').slice(0,100)) + '</td>';
+        html += '<td title="' + esc(m.user_id) + '">' + esc((m.user_id||'-').slice(-16)) + '</td>';
+        html += '<td title="' + esc(spokenBy) + '">' + esc(spokenBy || '-') + '</td>';
+        html += '<td class="ops">';
+        html += '<button type="button" class="secondary" onclick="startEdit(\'' + jsStr(id) + '\')">编辑</button>';
+        if (pendingDeleteId === id) {
+            html += '<button type="button" class="warn" onclick="delNow(\'' + jsStr(id) + '\')">确认删除</button>';
+            html += '<button type="button" class="ghost" onclick="cancelDelete()">取消</button>';
+        } else {
+            html += '<button type="button" onclick="askDelete(\'' + jsStr(id) + '\')">删除</button>';
+        }
+        html += '</td></tr>';
+        if (editingId === id) {
+            html += '<tr class="edit-row"><td colspan="5"><div class="edit-box">';
+            html += '<div class="edit-meta">';
+            html += '<div><label for="editUserId">user_id</label><input id="editUserId" value="' + esc(m.user_id || '') + '"></div>';
+            html += '<div><label for="editSpokenBy">spoken_by</label><input id="editSpokenBy" value="' + esc(spokenBy) + '"></div>';
+            html += '</div>';
+            html += '<label for="editMemory">记忆内容</label><textarea id="editMemory">' + esc(m.memory || '') + '</textarea>';
+            html += '<div class="edit-actions"><button type="button" class="primary" onclick="saveEdit(\'' + jsStr(id) + '\')">保存</button><button type="button" class="ghost" onclick="cancelEdit()">取消</button></div>';
+            html += '</div></td></tr>';
+        }
     });
     document.getElementById('tbl').innerHTML = html;
 }
-async function del(id) {
-    if (!confirm('确认删除？')) return;
-    await fetch('/memories/delete', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id})});
-    load();
+
+async function addMemory() {
+    let memory = document.getElementById('newMemory').value.trim();
+    let user_id = document.getElementById('newUserId').value.trim();
+    let spoken_by = document.getElementById('newSpokenBy').value.trim();
+    if (!memory) { setStatus('记忆内容不能为空', false); return; }
+    if (!user_id) { setStatus('user_id 不能为空', false); return; }
+    try {
+        await api('/memories/add', {memory, user_id, spoken_by});
+        document.getElementById('newMemory').value = '';
+        setStatus('新增成功', true);
+        await load();
+    } catch (e) {
+        setStatus('新增失败：' + e.message, false);
+    }
 }
+
+function startEdit(id) {
+    editingId = id;
+    pendingDeleteId = '';
+    render();
+}
+
+function cancelEdit() {
+    editingId = '';
+    render();
+}
+
+async function saveEdit(id) {
+    let el = document.getElementById('editMemory');
+    let userEl = document.getElementById('editUserId');
+    let spokenEl = document.getElementById('editSpokenBy');
+    let memory = el ? el.value.trim() : '';
+    let user_id = userEl ? userEl.value.trim() : '';
+    let spoken_by = spokenEl ? spokenEl.value.trim() : '';
+    if (!memory) { setStatus('记忆内容不能为空', false); return; }
+    if (!user_id) { setStatus('user_id 不能为空', false); return; }
+    try {
+        await api('/memories/update', {id, memory, user_id, spoken_by});
+        editingId = '';
+        setStatus('修改成功', true);
+        await load();
+    } catch (e) {
+        setStatus('修改失败：' + e.message, false);
+    }
+}
+
+function askDelete(id) {
+    pendingDeleteId = id;
+    editingId = '';
+    render();
+}
+
+function cancelDelete() {
+    pendingDeleteId = '';
+    render();
+}
+
+async function delNow(id) {
+    try {
+        await api('/memories/delete', {id});
+        pendingDeleteId = '';
+        setStatus('删除成功', true);
+        await load();
+    } catch (e) {
+        setStatus('删除失败：' + e.message, false);
+    }
+}
+
 load();
 </script>
 </body>

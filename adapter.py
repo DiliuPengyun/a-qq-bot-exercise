@@ -8,6 +8,8 @@
 import os
 import re
 import asyncio
+from datetime import datetime
+from typing import Any
 import httpx
 from dotenv import load_dotenv
 from ncatbot.app.client import BotClient
@@ -28,7 +30,7 @@ BOT_NAME = os.getenv("BOT_NAME", str(cfg.bot_uin))
 bot = BotClient()
 
 
-async def get_group_info(event) -> dict:
+async def get_group_info(event: Any) -> dict[str, Any]:
     """获取群基本信息（每次实时查询，群主和管理员可能变更）"""
     group_id = str(event.group_id)
     try:
@@ -49,7 +51,7 @@ async def get_group_info(event) -> dict:
         return {"member_count": 0, "owner_name": "", "admin_names": []}
 
 
-async def resolve_at_mentions(event) -> str:
+async def resolve_at_mentions(event: Any) -> str:
     """把 raw_message 中的 [CQ:at,qq=xxx] 替换成 @昵称"""
     raw = event.raw_message or ""
     group_id = getattr(event, "group_id", None) if hasattr(event, "message_type") and event.message_type == MessageType.GROUP else None
@@ -77,7 +79,7 @@ async def resolve_at_mentions(event) -> str:
     return re.sub(r"\[CQ:at,qq=(\d+)\]", repl, raw)
 
 
-def has_at_mention(event) -> bool:
+def has_at_mention(event: Any) -> bool:
     """检测是否 @ 了 Bot（仅告知模型，不强制回复）"""
     bot_qq = str(cfg.bot_uin)
     if hasattr(event, "message") and event.message:
@@ -88,8 +90,8 @@ def has_at_mention(event) -> bool:
 
 
 async def call_agent(
-    user_id: str, nickname: str, message: str, is_direct: bool, group_info: dict = None,
-    mentioned: bool = False, gender: str = "",
+    user_id: str, nickname: str, message: str, is_direct: bool, group_info: dict[str, Any] | None = None,
+    mentioned: bool = False, gender: str = "", sender_id: str = "", message_time: str = "",
 ) -> list[tuple[str, bool]]:
     """调用 Agent，返回 [(reply, quote), ...]"""
     body = {
@@ -99,6 +101,10 @@ async def call_agent(
         "is_direct": is_direct,
         "bot_name": BOT_NAME,
     }
+    if sender_id:
+        body["sender_id"] = sender_id
+    if message_time:
+        body["message_time"] = message_time
     if gender:
         body["gender"] = gender
     if mentioned:
@@ -116,7 +122,7 @@ async def call_agent(
 
 
 @registrar.on("message")
-async def handle_message(event):
+async def handle_message(event: Any) -> None:
     is_group = event.message_type == MessageType.GROUP
     # 群聊：群名片（QQ昵称）；私聊：QQ昵称
     if is_group:
@@ -141,9 +147,18 @@ async def handle_message(event):
     resolved_msg = await resolve_at_mentions(event) if is_group else event.raw_message
     # 获取群信息
     group_info = await get_group_info(event) if is_group else None
+    sender_id = str(event.user_id)
+    raw_time = getattr(event, "time", None) or getattr(event, "message_time", None)
+    if raw_time:
+        try:
+            message_time = datetime.fromtimestamp(int(raw_time)).strftime("%Y-%m-%d %H:%M")
+        except (TypeError, ValueError, OSError):
+            message_time = ""
+    else:
+        message_time = ""
 
     try:
-        replies = await call_agent(user_id, nickname, resolved_msg, is_direct, group_info, mentioned, gender)
+        replies = await call_agent(user_id, nickname, resolved_msg, is_direct, group_info, mentioned, gender, sender_id, message_time)
     except Exception as e:
         replies = [(f"出错了：{e}", False)]
 
