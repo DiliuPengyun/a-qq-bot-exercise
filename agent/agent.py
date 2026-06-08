@@ -11,7 +11,7 @@ DeepSeek Agent —— 接 DeepSeek V4 Flash，带 Mem0 长期记忆。
 
 启动: python agent/agent.py
 接口: POST /chat
-      请求 {"user_id": "...", "nickname": "...", "message": "...", "is_direct": true/false}
+      请求 {"user_id": "...", "nickname": "...", "message": "...", "is_direct": true/false, "qq_name": "...", "group_card": "..."}
       返回 {"reply": "..."|null, "quote": true/false}
 """
 
@@ -40,9 +40,9 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 # 情感事件：{"start_at", "end_at", "event", "emotion"}
 EmotionEvent = dict[str, Any]
-# 单用户情感数据：{"display_name", "summary_before_30d", "logs", "updated_at"}
+# 单用户情感数据：{"display_name", "summary_before_30d", "current_emotion", "emotion_trend", "emotion_history", "logs", "updated_at"}
 EmotionUser = dict[str, Any]
-# emotions.json 顶层：{"schema_version", "updated_at", "migrated_dynamic_prompt", "users"}
+# emotions.json 顶层：{"schema_version", "updated_at", "users"}
 EmotionData = dict[str, Any]
 # 对话历史单条：{"role", "content", "ts", "sender_id", "nickname", "person_id"}
 HistoryMsg = dict[str, Any]
@@ -53,6 +53,7 @@ HistoryMsg = dict[str, Any]
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 DEEPSEEK_KEY = os.getenv("DEEPSEEK_API_KEY")
 MODEL = "deepseek-v4-flash"
+SETTLE_MODEL = "deepseek-v4-pro"  # 结算（摘要 + 日记）用 Pro，避免 Flash 事实性错误
 
 SILICONFLOW_KEY = os.getenv("SILICONFLOW_API_KEY", "")
 SILICONFLOW_BASE = "https://api.siliconflow.cn/v1"
@@ -141,11 +142,10 @@ def _load_emotions() -> EmotionData:
             if isinstance(data, dict) and isinstance(data.get("users"), dict):
                 data.setdefault("schema_version", 1)
                 data.setdefault("updated_at", "")
-                data.setdefault("migrated_dynamic_prompt", False)
                 return data
         except Exception as e:
             print(f"[Emotion] 读取失败: {e}")
-    return {"schema_version": 1, "updated_at": "", "migrated_dynamic_prompt": False, "users": {}}
+    return {"schema_version": 1, "updated_at": "", "users": {}}
 
 
 def _save_emotions(data: EmotionData) -> None:
@@ -197,9 +197,23 @@ def _format_emotions_for_prompt(session_id: str) -> str:
     if not users:
         return ""
 
-    rows = ["| 用户 | 情感日志 |", "| --- | --- |"]
+    rows = ["| 用户 | 当前态度 | 趋势 | 情感变化轨迹 | 近期事件 |", "| --- | --- | --- | --- | --- |"]
     for pid, user in _sort_emotion_users(users, session_id):
         display = str(user.get("display_name") or pid)
+        current = str(user.get("current_emotion") or "").strip()
+        trend = str(user.get("emotion_trend") or "stable")
+        trend_display = {"up": "↑", "stable": "→", "down": "↓"}.get(trend, "→")
+        # 情感变化轨迹
+        history_parts = []
+        for h in list(user.get("emotion_history") or []):
+            if isinstance(h, dict):
+                at = str(h.get("at") or "")[5:16]  # "2026-06-05 12:02" → "06-05 12:02"
+                em = str(h.get("emotion") or "")
+                tr = str(h.get("trend") or "stable")
+                tr_sym = {"up": "↑", "stable": "→", "down": "↓"}.get(tr, "→")
+                history_parts.append(f"{at} {em} {tr_sym}")
+        history_text = "<br>".join(history_parts) or "无"
+        # 近期事件
         parts = []
         logs = list(user.get("logs") or [])
         logs.sort(key=_event_time_key, reverse=True)
@@ -209,8 +223,8 @@ def _format_emotions_for_prompt(session_id: str) -> str:
         summary = str(user.get("summary_before_30d") or "").strip()
         if summary:
             parts.append(f"30天前摘要：{summary}")
-        if parts:
-            rows.append(f"| {display} | {'<br>'.join(parts)} |")
+        if parts or current:
+            rows.append(f"| {display} | {current or '无'} | {trend_display} | {history_text} | {'<br>'.join(parts) or '无'} |")
     if len(rows) == 2:
         return ""
     return "\n".join(rows)
@@ -225,7 +239,7 @@ def _emotions_json() -> EmotionData:
 def _emotion_upsert_user(person_id: str, display_name: str, summary_before_30d: str = "") -> EmotionUser:
     data = _load_emotions()
     users = data.setdefault("users", {})
-    user = users.setdefault(person_id, {"display_name": display_name, "summary_before_30d": "", "logs": []})
+    user = users.setdefault(person_id, {"display_name": display_name, "summary_before_30d": "", "current_emotion": "", "emotion_trend": "stable", "emotion_history": [], "logs": []})
     user["display_name"] = display_name or user.get("display_name") or person_id
     if summary_before_30d:
         user["summary_before_30d"] = summary_before_30d
@@ -237,7 +251,7 @@ def _emotion_upsert_user(person_id: str, display_name: str, summary_before_30d: 
 def _emotion_add_event(person_id: str, display_name: str, event: dict[str, Any]) -> EmotionEvent:
     data = _load_emotions()
     users = data.setdefault("users", {})
-    user = users.setdefault(person_id, {"display_name": display_name, "summary_before_30d": "", "logs": []})
+    user = users.setdefault(person_id, {"display_name": display_name, "summary_before_30d": "", "current_emotion": "", "emotion_trend": "stable", "emotion_history": [], "logs": []})
     user["display_name"] = display_name or user.get("display_name") or person_id
     logs = user.setdefault("logs", [])
     item = {
@@ -686,13 +700,24 @@ DIARY_PROMPT = (
 )
 
 EMOTION_PROMPT = (
-    "你是第六谷绫。请根据已有情感记忆和昨天 QQ 群聊，更新你对群友的情感事件日志。\n"
-    "输出 JSON 数组。每个元素代表一个用户：person_id、display_name、events。\n"
-    "events 里每条包含 start_at、end_at、event、emotion。时间使用对话记录里的时分。\n"
-    "一天内同一用户可以有多条事件。"
+    "你是第六谷绫。请根据已有情感记忆和群聊记录，更新你对群友的情感状态。\n\n"
+    "输出 JSON 数组，每个元素代表一个用户，包含：\n"
+    "- person_id：必须直接复制聊天记录中每条消息前括号里的标识，格式如 'group_xxx:123456'，禁止使用昵称\n"
+    "- display_name：用户的简短称呼\n"
+    "- current_emotion：你现在对 ta 的整体情感态度（一句话，如「亲近但无奈」「厌烦」）\n"
+    "- emotion_trend：情感趋势，三选一：up（变好）/ stable（不变）/ down（变差）\n"
+    "- events：情感事件数组，每条含 start_at、end_at、event、emotion\n\n"
+    "规则：\n"
+    "1. person_id 必须是 '会话ID:数字ID' 格式，从聊天记录的 (group_xxx:数字) 中复制\n"
+    "2. 同一互动只记一条事件，不要对同一件事生成多条重复记录；"
+    "也不要把同一天多个不同互动合并成一条大范围事件——每段独立互动各记一条\n"
+    "3. 只记录真实影响了你情感的互动，没有互动或情感无波动则不记\n"
+    "4. start_at/end_at 使用聊天记录中的完整时间（含日期），如 '2026-06-05 12:02'\n"
+    "5. event 只写客观事实（对方说了什么、做了什么），禁止写主观推断（如「幸灾乐祸」「无聊起哄」「把我当玩具」）\n"
+    "6. emotion 写你的主观感受，简短标签式（如「厌烦」「温暖」「无奈」）\n"
+    "7. current_emotion 是你此刻的整体态度归纳，不是某一条事件的情绪\n"
+    "8. emotion_trend 是相比上一次归纳的变化方向，没有变化写 stable\n"
 )
-# 可按需加入但先不限制模型发挥：只输出真实影响情感的互动；不要把不同情感方向强行合并；
-# 没有明显变化时由模型判断是否记录；start_at/end_at 分别取相关消息第一条和最后一条时间。
 
 EMOTION_REPAIR_PROMPT = "把下面内容修成合法 JSON 数组，只输出 JSON。"
 
@@ -704,18 +729,18 @@ EMOTION_ROLLUP_PROMPT = (
 
 def _history_text(history: list[HistoryMsg]) -> str:
     user_msgs = [h for h in history if h["role"] == "user"]
-    lines = []
+    lines: list[str] = []
     for h in user_msgs:
         content = h.get("content", "")
         ts = h.get("ts")
-        if ts:
-            lines.append(f"[{ts}] {content}")
-        else:
-            lines.append(content)
+        pid = h.get("person_id", "")
+        tag = f"[{ts}]" if ts else ""
+        pid_tag = f"({pid})" if pid else ""
+        lines.append(f"{tag}{pid_tag} {content}" if tag or pid_tag else content)
     return "\n".join(lines)
 
 
-async def _call_deepseek_text(system_prompt: str, text: str, tag: str) -> str | None:
+async def _call_deepseek_text(system_prompt: str, text: str, tag: str, *, model: str = MODEL) -> str | None:
     if len(text.strip()) < 50:
         return None
     try:
@@ -724,7 +749,7 @@ async def _call_deepseek_text(system_prompt: str, text: str, tag: str) -> str | 
             resp = await client.post(
                 DEEPSEEK_URL, headers=headers,
                 json={
-                    "model": MODEL,
+                    "model": model,
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": text[:30000]},
@@ -741,7 +766,7 @@ async def _call_deepseek_text(system_prompt: str, text: str, tag: str) -> str | 
 async def _call_deepseek_for_settle(system_prompt: str, history: list[HistoryMsg], tag: str) -> str | None:
     """结算辅助：从历史中提取用户消息 → 调 DeepSeek → 返回响应文本"""
     text = _history_text(history)
-    return await _call_deepseek_text(system_prompt, text, tag)
+    return await _call_deepseek_text(system_prompt, text, tag, model=SETTLE_MODEL)
 
 
 def _extract_json_array(text: str) -> list[Any] | None:
@@ -768,7 +793,7 @@ async def _json_array_with_repair(text: str, tag: str) -> list[Any] | None:
         value = _extract_json_array(current)
         if value is not None:
             return value
-        repaired = await _call_deepseek_text(EMOTION_REPAIR_PROMPT, current, f"{tag}Repair{attempt + 1}")
+        repaired = await _call_deepseek_text(EMOTION_REPAIR_PROMPT, current, f"{tag}Repair{attempt + 1}", model=SETTLE_MODEL)
         if not repaired:
             return None
         current = repaired
@@ -796,62 +821,44 @@ async def _rollup_emotion_user(user: EmotionUser) -> None:
     old_summary = str(user.get("summary_before_30d") or "")
     expired_text = "\n".join(_format_event(e) for e in sorted(expired, key=_event_time_key))
     text = f"旧摘要：{old_summary}\n\n过期日志：\n{expired_text}"
-    summary = await _call_deepseek_text(EMOTION_ROLLUP_PROMPT, text, "EmotionRollup")
+    summary = await _call_deepseek_text(EMOTION_ROLLUP_PROMPT, text, "EmotionRollup", model=SETTLE_MODEL)
     user["summary_before_30d"] = (summary or old_summary or expired_text).strip()
     user["logs"] = sorted(recent, key=_event_time_key, reverse=True)
 
 
-def _migrate_dynamic_prompt_emotions(session_id: str) -> None:
-    data = _load_emotions()
-    if data.get("migrated_dynamic_prompt"):
-        return
-    if not os.path.exists(DYNAMIC_PROMPT_FILE):
-        data["migrated_dynamic_prompt"] = True
-        _save_emotions(data)
-        return
-
-    with open(DYNAMIC_PROMPT_FILE, encoding="utf-8") as f:
-        old = f.read()
-    marker = "=== 昨日情感 ==="
-    if marker not in old:
-        data["migrated_dynamic_prompt"] = True
-        _save_emotions(data)
-        return
-
-    users = data.setdefault("users", {})
-    table = old.split(marker, 1)[1].strip()
-    for line in table.splitlines():
-        line = line.strip()
-        if not line.startswith("|") or "---" in line or "名称" in line:
-            continue
-        cells = [c.strip() for c in line.strip("|").split("|")]
-        if len(cells) < 2 or not cells[0] or not cells[1]:
-            continue
-        display = cells[0]
-        pid = _person_id(session_id, None, display)
-        user = users.setdefault(pid, {"display_name": display, "summary_before_30d": "", "logs": []})
-        user["display_name"] = display
-        summary = str(user.get("summary_before_30d") or "").strip()
-        migrated = f"旧动态情感迁移：{cells[1]}"
-        user["summary_before_30d"] = f"{summary}\n{migrated}".strip() if summary else migrated
-        user["updated_at"] = _now_minute()
-    data["migrated_dynamic_prompt"] = True
-    _save_emotions(data)
-
-
 async def _update_emotions(history: list[HistoryMsg], session_id: str) -> None:
-    _migrate_dynamic_prompt_emotions(session_id)
     text = _history_text(history)
     if not text:
         return
     existing = _format_emotions_for_prompt(session_id)
     payload = f"<已有情感记忆>\n{existing or '（无）'}\n</已有情感记忆>\n\n<昨天群聊记录>\n{text}\n</昨天群聊记录>"
-    result = await _call_deepseek_text(EMOTION_PROMPT, payload, "Emotion")
+    result = await _call_deepseek_text(EMOTION_PROMPT, payload, "Emotion", model=SETTLE_MODEL)
     if not result:
         return
     updates = await _json_array_with_repair(result, "Emotion")
     if updates is None:
         return
+
+    # 从 history 构建 映射，用于 person_id 反查
+    nickname_to_pid: dict[str, str] = {}       # 全昵称 → person_id
+    subname_to_pid: dict[str, str] = {}        # QQ昵称/群名片 → person_id
+    for h in history:
+        if h.get("role") != "user":
+            continue
+        h_pid = str(h.get("person_id") or "").strip()
+        h_nick = str(h.get("nickname") or "").strip()
+        if h_pid and h_nick:
+            nickname_to_pid[h_nick] = h_pid
+            # 优先用 adapter 传入的独立字段
+            h_qq = str(h.get("qq_name") or "").strip()
+            h_card = str(h.get("group_card") or "").strip()
+            if h_qq:
+                subname_to_pid.setdefault(h_qq, h_pid)
+            if h_card:
+                subname_to_pid.setdefault(h_card, h_pid)
+
+    # 当天日期，用于补全只有时分的时间
+    today = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
 
     data = _load_emotions()
     users = data.setdefault("users", {})
@@ -860,19 +867,56 @@ async def _update_emotions(history: list[HistoryMsg], session_id: str) -> None:
             continue
         display = str(item.get("display_name") or "").strip()
         pid = str(item.get("person_id") or "").strip()
-        if not pid:
-            pid = _person_id(session_id, item.get("sender_id"), display)
+
+        # person_id 格式校验：必须是 session_id:sender_id 格式
+        if ":" not in pid:
+            # 模型返回了昵称而非 person_id，尝试从 history 反查
+            resolved = (
+                nickname_to_pid.get(pid)
+                or nickname_to_pid.get(display)
+                or subname_to_pid.get(pid)
+                or subname_to_pid.get(display)
+            )
+            if resolved:
+                pid = resolved
+            else:
+                # 最后兜底：用 _person_id 构造
+                pid = _person_id(session_id, item.get("sender_id"), display)
+
         if not display:
             display = pid
-        user = users.setdefault(pid, {"display_name": display, "summary_before_30d": "", "logs": []})
+        user = users.setdefault(pid, {"display_name": display, "summary_before_30d": "", "current_emotion": "", "emotion_trend": "stable", "emotion_history": [], "logs": []})
         user["display_name"] = display
+        # 更新当前情感状态
+        ce = str(item.get("current_emotion") or "").strip()
+        et = str(item.get("emotion_trend") or "").strip().lower()
+        if et not in ("up", "stable", "down"):
+            et = "stable"
+        old_ce = str(user.get("current_emotion") or "").strip()
+        if ce:
+            # 情感有变化或首次记录 → 追加到 history
+            if ce != old_ce:
+                history_list = user.setdefault("emotion_history", [])
+                history_list.append({"at": _now_minute(), "emotion": ce, "trend": et})
+                # 保留最近 30 条，防止无限增长
+                if len(history_list) > 30:
+                    user["emotion_history"] = history_list[-30:]
+            user["current_emotion"] = ce
+            user["emotion_trend"] = et
         logs = user.setdefault("logs", [])
         for event in item.get("events") or []:
             if not isinstance(event, dict):
                 continue
-            entry = {
-                "start_at": str(event.get("start_at") or _now_minute()),
-                "end_at": str(event.get("end_at") or event.get("start_at") or _now_minute()),
+            start = str(event.get("start_at") or _now_minute()).strip()
+            end = str(event.get("end_at") or event.get("start_at") or _now_minute()).strip()
+            # 补全日期：如果只有时分 (如 "23:13") 则补上当天日期
+            if len(start) <= 5 and ":" in start:
+                start = f"{today} {start}"
+            if len(end) <= 5 and ":" in end:
+                end = f"{today} {end}"
+            entry: EmotionEvent = {
+                "start_at": start,
+                "end_at": end,
                 "event": str(event.get("event") or "").strip(),
                 "emotion": str(event.get("emotion") or "").strip(),
             }
@@ -928,27 +972,27 @@ async def _update_dynamic_prompt(history: list[HistoryMsg]) -> None:
     if not diary:
         return
 
-    # 解析日记和情感列表
+    # 解析日记（情感已由 emotions.json 承担，不再写入此处）
     diary_text = ""
-    sentiment_text = ""
     diary_match = re.search(r"<日记>(.*?)</日记>", diary, re.DOTALL)
-    sentiment_match = re.search(r"<情感>(.*?)</情感>", diary, re.DOTALL)
     if diary_match:
         diary_text = diary_match.group(1).strip()
     else:
-        # 兼容旧格式：整个输出当日记
         diary_text = diary.strip()
-    if sentiment_match:
-        sentiment_text = sentiment_match.group(1).strip()
 
-    # 拼可变提示词
     dynamic = f"=== 昨日状态 ===\n{diary_text}"
-    if sentiment_text:
-        dynamic += f"\n\n=== 昨日情感 ===\n{sentiment_text}"
 
     with open(DYNAMIC_PROMPT_FILE, "w", encoding="utf-8") as f:
         f.write(dynamic)
     print(f"[DynamicPrompt] 日记已更新: {diary_text[:80]}...")
+
+
+async def _safe_settle(user_id: str, history: list[HistoryMsg]) -> None:
+    """结算包装：捕获异常，防止后台任务崩溃"""
+    try:
+        await check_and_settle(user_id, history)
+    except Exception as e:
+        print(f"[Settle] 后台结算失败: {e}")
 
 
 async def check_and_settle(user_id: str, history: list[HistoryMsg]) -> None:
@@ -1236,6 +1280,7 @@ async def call_deepseek(
     user_id: str, nickname: str, message: str, is_direct: bool, bot_name: str = "",
     group_info: dict[str, Any] | None = None, mentioned: bool = False, gender: str = "",
     sender_id: str = "", message_time: str = "",
+    qq_name: str = "", group_card: str = "",
 ) -> list[tuple[str, bool]]:
     bot_name = bot_name or DEFAULT_BOT_NAME
     history = get_history(user_id)
@@ -1359,14 +1404,16 @@ async def call_deepseek(
         "ts": ts,
         "sender_id": sender_id,
         "nickname": nickname,
+        "qq_name": qq_name,
+        "group_card": group_card,
         "person_id": _person_id(user_id, sender_id, nickname),
     })
     for rep, _ in final_replies:
         history.append({"role": "assistant", "content": f"<{bot_name}> {rep}", "ts": _now_minute()})
     save_history(user_id, history)
 
-    # 6. 每日结算记忆（在回复前同步执行）
-    await check_and_settle(user_id, history)
+    # 6. 每日结算记忆（后台执行，不阻塞回复）
+    asyncio.create_task(_safe_settle(user_id, history))
 
     # 7. 打字延迟
     await asyncio.sleep(random.uniform(0.5, 2.5))
@@ -1387,11 +1434,13 @@ async def chat(request: web.Request) -> web.Response:
     gender = body.get("gender", "")
     sender_id = body.get("sender_id", "")
     message_time = body.get("message_time", "")
+    qq_name = body.get("qq_name", "")
+    group_card = body.get("group_card", "")
 
     bot_name = body.get("bot_name", "")
     group_info = body.get("group_info")
     try:
-        replies = await call_deepseek(user_id, nickname, message, is_direct, bot_name, group_info, mentioned, gender, sender_id, message_time)
+        replies = await call_deepseek(user_id, nickname, message, is_direct, bot_name, group_info, mentioned, gender, sender_id, message_time, qq_name, group_card)
     except Exception as e:
         traceback.print_exc()
         return web.json_response({"replies": [{"reply": f"出错了：{e}", "quote": False}]})
@@ -1426,7 +1475,52 @@ _webui_ctx = {
     "DYNAMIC_PROMPT_FILE": DYNAMIC_PROMPT_FILE,
 }
 
+_SETTLE_HOUR = 2  # 每天凌晨 2:00 自动结算
+_settle_task: asyncio.Task | None = None
+
+
+async def _auto_settle_loop() -> None:
+    """后台定时任务：每天凌晨 2:00 对所有会话执行结算"""
+    while True:
+        now = datetime.now(LOCAL_TZ)
+        target = now.replace(hour=_SETTLE_HOUR, minute=0, second=5, microsecond=0)
+        if now >= target:
+            target += timedelta(days=1)
+        wait = (target - now).total_seconds()
+        print(f"[Settle] 下次自动结算: {target.strftime('%Y-%m-%d %H:%M')}")
+        await asyncio.sleep(wait)
+
+        # 扫描所有 session，对需要结算的执行
+        boundary = _settlement_boundary()
+        settlements = _get_settlements()
+        for fname in os.listdir(SESSIONS_DIR):
+            if not fname.endswith(".json"):
+                continue
+            uid = fname[:-5]  # group_xxx / private_xxx
+            if settlements.get(uid, "") >= boundary.isoformat():
+                continue  # 已结算
+            history = get_history(uid)
+            if not history:
+                continue
+            try:
+                await check_and_settle(uid, history)
+            except Exception as e:
+                print(f"[Settle] 自动结算 {uid} 失败: {e}")
+
+
+async def _on_startup(app: web.Application) -> None:
+    global _settle_task
+    _settle_task = asyncio.create_task(_auto_settle_loop())
+
+
+async def _on_cleanup(app: web.Application) -> None:
+    if _settle_task:
+        _settle_task.cancel()
+
+
 app = web.Application()
+app.on_startup.append(_on_startup)
+app.on_cleanup.append(_on_cleanup)
 app.router.add_post("/chat", chat)
 setup_routes(app, _webui_ctx)
 

@@ -116,7 +116,8 @@ python adapter.py
 
 ### 群成员信息与性别传递
 - Adapter 从 `event.sender.sex` 取值，传 `gender` 字段给 Agent
-- 群聊昵称格式为 `群名片（QQ昵称）`，没有群名片则用 QQ 昵称；私聊用 QQ 昵称
+- 群聊昵称格式为 `群名片(QQ昵称)`（半角括号包裹QQ昵称），名字内的半角括号用 `\(` `\)` 转义；没有群名片则只用 QQ 昵称；私聊用 QQ 昵称
+- Adapter 传独立字段 `qq_name` 和 `group_card`，Agent 反查 person_id 时直接使用，不再解析括号
 - Agent 当轮用户消息显示为 `<昵称 ♂>` 或 `<昵称 ♀>` 格式，System prompt 教模型看懂 ♂♀ 符号并据此用对「他」「她」
 - 注意：当前保存历史时仍写成 `<昵称> 消息`，没有把性别符号落盘；所以每日结算看不到历史性别，这是 TODO
 - Adapter 每条群消息实时查群成员列表，给 Agent 传 `group_info`：群人数、群主昵称、管理员昵称列表

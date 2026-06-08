@@ -92,6 +92,7 @@ def has_at_mention(event: Any) -> bool:
 async def call_agent(
     user_id: str, nickname: str, message: str, is_direct: bool, group_info: dict[str, Any] | None = None,
     mentioned: bool = False, gender: str = "", sender_id: str = "", message_time: str = "",
+    qq_name: str = "", group_card: str = "",
 ) -> list[tuple[str, bool]]:
     """调用 Agent，返回 [(reply, quote), ...]"""
     body = {
@@ -111,6 +112,10 @@ async def call_agent(
         body["mentioned"] = True
     if group_info:
         body["group_info"] = group_info
+    if qq_name:
+        body["qq_name"] = qq_name
+    if group_card:
+        body["group_card"] = group_card
     async with httpx.AsyncClient(timeout=AGENT_TIMEOUT) as client:
         resp = await client.post(AGENT_URL, json=body)
         resp.raise_for_status()
@@ -124,14 +129,23 @@ async def call_agent(
 @registrar.on("message")
 async def handle_message(event: Any) -> None:
     is_group = event.message_type == MessageType.GROUP
-    # 群聊：群名片（QQ昵称）；私聊：QQ昵称
+    # 群聊：群名片(QQ昵称)；私聊：QQ昵称
+    # 半角 () 包裹 QQ 昵称，名字内的半角括号用 \ 转义
+    def _escape_parens(s: str) -> str:
+        return s.replace("(", r"\(").replace(")", r"\)")
+
     if is_group:
         card = event.sender.card or ""
         qq_name = event.sender.nickname or event.user_id
-        nickname = f"{card}（{qq_name}）" if card else qq_name
+        if card:
+            nickname = f"{_escape_parens(card)}({_escape_parens(qq_name)})"
+        else:
+            nickname = _escape_parens(qq_name)
         gender = getattr(event.sender, "sex", "") or ""
     else:
-        nickname = event.sender.nickname or event.user_id
+        qq_name = event.sender.nickname or event.user_id
+        nickname = _escape_parens(qq_name)
+        card = ""
         gender = ""
 
     if is_group:
@@ -158,7 +172,7 @@ async def handle_message(event: Any) -> None:
         message_time = ""
 
     try:
-        replies = await call_agent(user_id, nickname, resolved_msg, is_direct, group_info, mentioned, gender, sender_id, message_time)
+        replies = await call_agent(user_id, nickname, resolved_msg, is_direct, group_info, mentioned, gender, sender_id, message_time, qq_name, card)
     except Exception as e:
         replies = [(f"出错了：{e}", False)]
 

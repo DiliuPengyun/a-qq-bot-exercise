@@ -24,6 +24,18 @@ button.ghost { background: #444; }
 .ok { color: #4ecca3; }
 .err { color: #ff6b6b; }
 .id { font-family: monospace; color: #aaa; font-size: .72rem; }
+.current { background: #1a3a1a; border: 1px solid #4ecca3; border-radius: 4px; padding: .5rem; margin: .5rem 0; }
+.current .label { color: #4ecca3; font-weight: bold; font-size: .85rem; }
+.current .emotion-text { color: #e0e0e0; font-size: .9rem; margin: .2rem 0; }
+.trend-up { color: #4ecca3; }
+.trend-stable { color: #7ec8e3; }
+.trend-down { color: #ff6b6b; }
+.history-line { padding: .15rem 0; font-size: .78rem; border-bottom: 1px solid #222; }
+.history-line:last-child { border-bottom: none; }
+.history-time { color: #888; font-family: monospace; }
+.history-emotion { color: #e0e0e0; }
+.history-section { background: #0f2440; border: 1px solid #333; border-radius: 4px; padding: .5rem; margin: .5rem 0; max-height: 200px; overflow-y: auto; }
+.section-title { color: #7ec8e3; font-size: .8rem; font-weight: bold; margin-bottom: .3rem; }
 @media (max-width: 700px) { .grid { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -44,6 +56,8 @@ button.ghost { background: #444; }
 let data = {users:{}};
 function esc(s) { return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 function js(s) { return String(s || '').replace(/\\/g,'\\\\').replace(/'/g,"\\'"); }
+function trendSymbol(t) { return {up:'↑',stable:'→',down:'↓'}[t]||'→'; }
+function trendClass(t) { return {up:'trend-up',stable:'trend-stable',down:'trend-down'}[t]||'trend-stable'; }
 function status(t, ok) { let el = document.getElementById('status'); el.textContent = t || ''; el.className = 'muted ' + (ok ? 'ok' : 'err'); }
 async function api(url, body) {
   let r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
@@ -60,6 +74,32 @@ function render() {
   entries.forEach(([pid, u]) => {
     html += '<div class="card user"><b>' + esc(u.display_name || pid) + '</b> <span class="id">' + esc(pid) + '</span>';
     html += '<div class="muted">updated_at: ' + esc(u.updated_at || '-') + '</div>';
+    // 当前情感状态
+    let ce = u.current_emotion || '无';
+    let et = u.emotion_trend || 'stable';
+    html += '<div class="current">';
+    html += '<span class="label">当前态度</span> ';
+    html += '<span class="emotion-text">' + esc(ce) + '</span> ';
+    html += '<span class="' + trendClass(et) + '" style="font-weight:bold">' + trendSymbol(et) + '</span>';
+    html += '</div>';
+    // 情感变化轨迹
+    let hist = u.emotion_history || [];
+    if (hist.length > 0) {
+      html += '<div class="history-section"><div class="section-title">📊 情感变化轨迹</div>';
+      // 最新的在前
+      for (let i = hist.length - 1; i >= 0; i--) {
+        let h = hist[i];
+        let at = String(h.at || '').substring(5, 16);
+        let em = h.emotion || '';
+        let tr = h.trend || 'stable';
+        html += '<div class="history-line">';
+        html += '<span class="history-time">' + esc(at) + '</span> ';
+        html += '<span class="history-emotion">' + esc(em) + '</span> ';
+        html += '<span class="' + trendClass(tr) + '">' + trendSymbol(tr) + '</span>';
+        html += '</div>';
+      }
+      html += '</div>';
+    }
     html += '<label>30天前摘要</label><textarea id="sum_' + esc(pid) + '">' + esc(u.summary_before_30d || '') + '</textarea>';
     html += '<button type="button" class="secondary" onclick="updateSummary(\'' + js(pid) + '\')">保存摘要</button>';
     html += '<button type="button" onclick="deleteUser(\'' + js(pid) + '\')">删除用户</button>';
