@@ -56,6 +56,7 @@ python adapter.py
 - 可变段标签从「当前状态」改成「昨日状态」，日记 prompt 要求用「昨天」开头
 - 文件从 `dynamic_prompt.txt` 改名为 `emotional_memory.txt`，保留日记/概要等感性记忆
 - 情感表独立为 `agent/emotions.json`，不再写在日记文件里
+- 角色名字统一为 `config.py` 常量 `BOT_NAME`/`CREATOR_NAME`：原先是半 `{bot_name}` 占位符半硬编码「第六谷绫」，外加一条 `BOT_NAME` env → adapter 请求体 → `call_deepseek` → `.format` 的半拉子通道，且两处 fallback 不一致（`"机器人助手"` vs `str(bot_uin)`）。名字与人格（赛博妹妹/叫哥）绑定，单独让名字可配置会人格分裂，故删掉 env 与请求体通道，所有提示词用 f-string 引用常量；`DIARY_PROMPT`/`EMOTION_PROMPT` 同步改。改名只改一处。
 
 ### 对话历史
 - 格式演变：`[昵称]: 消息` → `<昵称> 消息` → `<sender>` 标签格式（方括号被模型当成标记语法模仿，尖括号也有前缀残留问题）
@@ -318,7 +319,7 @@ User Prompt (每轮不同)
   agent/sessions.py           会话历史持久化 + 内存缓存
   agent/tools.py              工具定义 + 调用分发（search_web / should_quote / forget_memory）
   agent/utils.py              日期时间辅助 + spoken_by / person_id / history_text
-  agent/config.py             env 加载 / 路径 / 模型阈值 / 提示词（含结算 prompt）
+  agent/config.py             env 加载 / 路径 / 模型阈值 / 提示词（含结算 prompt）/ 身份常量 BOT_NAME·CREATOR_NAME
   agent/models.py             全局类型定义（TypedDict 集合）
   agent/webui.py              WebUI 路由和 JSON API（setup_routes 注入模式）
   agent/templates/*.html      WebUI 页面模板（首页/控制台/Mem0日志/记忆库/情感表）

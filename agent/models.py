@@ -124,7 +124,6 @@ class ChatRequestBody(TypedDict, total=False):
     message_time: str
     qq_name: str
     group_card: str
-    bot_name: str
     bot_qq: str
     group_info: GroupInfo
 

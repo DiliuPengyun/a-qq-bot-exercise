@@ -18,7 +18,7 @@
 
 启动: python agent/agent.py
 接口: POST /chat
-      请求 {"user_id", "nickname", "message", "is_direct", "bot_name", "bot_qq",
+      请求 {"user_id", "nickname", "message", "is_direct", "bot_qq",
             "sender_id", "message_time", "gender", "mentioned", "group_info",
             "qq_name", "group_card"}
       返回 {"replies": [{"reply": "...", "quote": true/false}, ...]}
@@ -70,10 +70,9 @@ async def chat(request: web.Request) -> web.Response:
     qq_name = body.get("qq_name", "")
     group_card = body.get("group_card", "")
 
-    bot_name = body.get("bot_name", "")
     group_info = body.get("group_info")
     try:
-        replies = await call_deepseek(user_id, nickname, message, is_direct, bot_name, group_info, mentioned, gender, sender_id, message_time, qq_name, group_card)
+        replies = await call_deepseek(user_id, nickname, message, is_direct, group_info, mentioned, gender, sender_id, message_time, qq_name, group_card)
     except Exception as e:
         traceback.print_exc()
         return web.json_response({"replies": [{"reply": f"出错了：{e}", "quote": False}]})

@@ -5,13 +5,11 @@
 前提: NapCat 已启动，WebSocket 端口 3001 已启用
 """
 
-import os
 import re
 import asyncio
 from datetime import datetime
 from typing import TypedDict, cast
 import httpx
-from dotenv import load_dotenv
 from ncatbot.app.client import BotClient
 from ncatbot.core.registry import registrar
 from ncatbot.types.qq import MessageEvent, MessageType
@@ -32,7 +30,6 @@ class ChatRequestBody(TypedDict, total=False):
     nickname: str
     message: str
     is_direct: bool
-    bot_name: str
     bot_qq: str
     sender_id: str
     message_time: str
@@ -42,14 +39,11 @@ class ChatRequestBody(TypedDict, total=False):
     qq_name: str
     group_card: str
 
-# 加载 agent/.env，让 BOT_NAME 等配置生效
-load_dotenv(os.path.join(os.path.dirname(__file__), "agent", ".env"))
 
 AGENT_URL = "http://127.0.0.1:8081/chat"
 AGENT_TIMEOUT = 30
 
 cfg = get_config_manager()
-BOT_NAME = os.getenv("BOT_NAME", str(cfg.bot_uin))
 
 bot = BotClient()
 
@@ -124,7 +118,6 @@ async def call_agent(
         "nickname": nickname,
         "message": message,
         "is_direct": is_direct,
-        "bot_name": BOT_NAME,
         "bot_qq": str(cfg.bot_uin),
     }
     if sender_id:

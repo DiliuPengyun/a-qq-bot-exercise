@@ -10,7 +10,7 @@ from typing import cast
 
 import httpx
 
-from config import DEFAULT_BOT_NAME, DEEPSEEK_KEY, DEEPSEEK_URL, DYNAMIC_PROMPT_FILE, MODEL, SYSTEM_PROMPT_BASE, SYSTEM_PROMPT_VARIABLE
+from config import BOT_NAME, DEEPSEEK_KEY, DEEPSEEK_URL, DYNAMIC_PROMPT_FILE, MODEL, SYSTEM_PROMPT_BASE, SYSTEM_PROMPT_VARIABLE
 from emotions import format_emotions_for_prompt
 from memstore import detect_conflicts, format_memories, search_memories
 from models import DeepSeekMessage, GroupInfo, MemSearchItem
@@ -24,12 +24,11 @@ from utils import now_minute, person_id
 
 
 async def call_deepseek(
-    user_id: str, nickname: str, message: str, is_direct: bool, bot_name: str = "",
+    user_id: str, nickname: str, message: str, is_direct: bool,
     group_info: GroupInfo | None = None, mentioned: bool = False, gender: str = "",
     sender_id: str = "", message_time: str = "",
     qq_name: str = "", group_card: str = "",
 ) -> list[tuple[str, bool]]:
-    bot_name = bot_name or DEFAULT_BOT_NAME
     history = get_history(user_id)
 
     # 1. 记忆检索
@@ -53,7 +52,7 @@ async def call_deepseek(
             dynamic = f.read().strip()
     else:
         dynamic = SYSTEM_PROMPT_VARIABLE
-    system = SYSTEM_PROMPT_BASE.format(bot_name=bot_name) + "\n" + dynamic
+    system = SYSTEM_PROMPT_BASE + "\n" + dynamic
     if group_info:
         owner = group_info.get("owner_name", "未知")
         count = group_info.get("member_count", 0)
@@ -140,7 +139,7 @@ async def call_deepseek(
                 continue
         # 去前缀
         stripped = rep
-        for fmt in (f"<{bot_name}> ", f"<{bot_name}>"):
+        for fmt in (f"<{BOT_NAME}> ", f"<{BOT_NAME}>"):
             while stripped.startswith(fmt):
                 stripped = stripped[len(fmt):]
             stripped = stripped.replace(f"\n{fmt}", "\n")
@@ -159,7 +158,7 @@ async def call_deepseek(
         "person_id": person_id(user_id, sender_id, nickname),
     })
     for rep, _ in final_replies:
-        history.append({"role": "assistant", "content": f"<{bot_name}> {rep}", "ts": now_minute()})
+        history.append({"role": "assistant", "content": f"<{BOT_NAME}> {rep}", "ts": now_minute()})
     save_history(user_id, history)
 
     # 6. 每日结算记忆（后台执行，不阻塞回复）
