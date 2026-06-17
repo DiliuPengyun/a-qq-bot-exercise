@@ -999,6 +999,7 @@ new_state = old_state * decay + baseline * (1 - decay)
 | 更多 Agent 工具 | 待定 |
 | 旧 qdrant 错误记忆清理 | 是否清空/迁移/重采现有错误记忆 |
 | `agent.py` 顶部注释/旧文档修正 | 端口、返回格式等说明已过时 |
+| 角色包（character pack） | 把身份/人格/记忆/情感/工具集打包成可整体切换的角色包，每个角色有各自的行为规则、可用工具、隔离的记忆库（Mem0 collection）与情感表。当前架构强假设单一角色（`config.py` 的 `BOT_NAME`/`CREATOR_NAME`、`SYSTEM_PROMPT_BASE`、`emotions.json`/`dynamic_prompt.txt`/Mem0 均与「第六谷绫」绑死）。架构级重构，启动前需详细讨论目录结构、路由、各模块参数化改造 |
 
 ---
 
