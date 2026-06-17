@@ -1,0 +1,6 @@
+"""Type stubs for ncatbot.app.client"""
+
+
+class BotClient:
+    def __init__(self, **kwargs: object) -> None: ...
+    def run(self) -> None: ...

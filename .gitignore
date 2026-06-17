@@ -14,6 +14,11 @@ agent/settlement_times.json
 agent/dynamic_prompt.txt
 agent/mem0_log.json
 agent/emotions.json
+# plan.md 规划但尚未实现的文件（实现后启用）：
+agent/emotional_memory.txt
+agent/known_facts.xml
+agent/user_map.json
+agent/mood.json
 data/
 config.yaml
 config.local.yaml

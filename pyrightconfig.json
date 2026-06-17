@@ -1,0 +1,13 @@
+{
+  "include": [
+    "adapter.py",
+    "agent/agent.py",
+    "agent/webui.py"
+  ],
+  "venvPath": ".",
+  "venv": "venv",
+  "typeCheckingMode": "strict",
+  "extraPaths": [
+    "stubs"
+  ]
+}

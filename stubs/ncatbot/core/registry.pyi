@@ -1,0 +1,16 @@
+"""Type stubs for ncatbot.core.registry"""
+from collections.abc import Callable
+from typing import TypeVar
+
+_T = TypeVar("_T", bound=Callable[..., object])
+
+
+class Registrar:
+    def on(self, event_type: str) -> Callable[[_T], _T]: ...
+    def on_message(self, func: _T) -> _T: ...
+    def on_notice(self, func: _T) -> _T: ...
+    def on_request(self, func: _T) -> _T: ...
+    def on_meta(self, func: _T) -> _T: ...
+
+
+registrar: Registrar

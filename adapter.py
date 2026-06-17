@@ -9,14 +9,38 @@ import os
 import re
 import asyncio
 from datetime import datetime
-from typing import Any
+from typing import TypedDict, cast
 import httpx
 from dotenv import load_dotenv
 from ncatbot.app.client import BotClient
 from ncatbot.core.registry import registrar
-from ncatbot.types.qq import MessageType
+from ncatbot.types.qq import MessageEvent, MessageType
 from ncatbot.types.common.segment import At
 from ncatbot.utils import get_config_manager
+
+
+class GroupInfo(TypedDict, total=False):
+    """群信息（注入 Agent system prompt）。"""
+    member_count: int
+    owner_name: str
+    admin_names: list[str]
+
+
+class ChatRequestBody(TypedDict, total=False):
+    """/chat 请求体（adapter 构造，发给 Agent）。"""
+    user_id: str
+    nickname: str
+    message: str
+    is_direct: bool
+    bot_name: str
+    bot_qq: str
+    sender_id: str
+    message_time: str
+    gender: str
+    mentioned: bool
+    group_info: GroupInfo
+    qq_name: str
+    group_card: str
 
 # 加载 agent/.env，让 BOT_NAME 等配置生效
 load_dotenv(os.path.join(os.path.dirname(__file__), "agent", ".env"))
@@ -30,13 +54,13 @@ BOT_NAME = os.getenv("BOT_NAME", str(cfg.bot_uin))
 bot = BotClient()
 
 
-async def get_group_info(event: Any) -> dict[str, Any]:
+async def get_group_info(event: MessageEvent) -> GroupInfo:
     """获取群基本信息（每次实时查询，群主和管理员可能变更）"""
     group_id = str(event.group_id)
     try:
         members = await event.api.query.get_group_member_list(group_id)
-        owner = ""
-        admins = []
+        owner: str = ""
+        admins: list[str] = []
         for m in members:
             if m.role == "owner":
                 owner = m.card or m.nickname or m.user_id
@@ -51,7 +75,7 @@ async def get_group_info(event: Any) -> dict[str, Any]:
         return {"member_count": 0, "owner_name": "", "admin_names": []}
 
 
-async def resolve_at_mentions(event: Any) -> str:
+async def resolve_at_mentions(event: MessageEvent) -> str:
     """把 raw_message 中的 [CQ:at,qq=xxx] 替换成 @昵称"""
     raw = event.raw_message or ""
     group_id = getattr(event, "group_id", None) if hasattr(event, "message_type") and event.message_type == MessageType.GROUP else None
@@ -72,17 +96,17 @@ async def resolve_at_mentions(event: Any) -> str:
             names[qq] = qq
 
     # 替换
-    def repl(m):
+    def repl(m: re.Match[str]) -> str:
         qq = m.group(1)
         return f"@{names.get(qq, qq)}"
 
     return re.sub(r"\[CQ:at,qq=(\d+)\]", repl, raw)
 
 
-def has_at_mention(event: Any) -> bool:
+def has_at_mention(event: MessageEvent) -> bool:
     """检测是否 @ 了 Bot（仅告知模型，不强制回复）"""
     bot_qq = str(cfg.bot_uin)
-    if hasattr(event, "message") and event.message:
+    if event.message:
         for seg in event.message:
             if isinstance(seg, At) and seg.user_id == bot_qq:
                 return True
@@ -90,17 +114,18 @@ def has_at_mention(event: Any) -> bool:
 
 
 async def call_agent(
-    user_id: str, nickname: str, message: str, is_direct: bool, group_info: dict[str, Any] | None = None,
+    user_id: str, nickname: str, message: str, is_direct: bool, group_info: GroupInfo | None = None,
     mentioned: bool = False, gender: str = "", sender_id: str = "", message_time: str = "",
     qq_name: str = "", group_card: str = "",
 ) -> list[tuple[str, bool]]:
     """调用 Agent，返回 [(reply, quote), ...]"""
-    body = {
+    body: ChatRequestBody = {
         "user_id": user_id,
         "nickname": nickname,
         "message": message,
         "is_direct": is_direct,
         "bot_name": BOT_NAME,
+        "bot_qq": str(cfg.bot_uin),
     }
     if sender_id:
         body["sender_id"] = sender_id
@@ -119,15 +144,16 @@ async def call_agent(
     async with httpx.AsyncClient(timeout=AGENT_TIMEOUT) as client:
         resp = await client.post(AGENT_URL, json=body)
         resp.raise_for_status()
-        data = resp.json()
-        replies = data.get("replies", [])
+        data = cast(dict[str, object], resp.json())
+        replies_raw = data.get("replies", [])
+        replies = cast(list[dict[str, object]], replies_raw) if isinstance(replies_raw, list) else []
         if replies:
-            return [(r["reply"], r.get("quote", False)) for r in replies if r.get("reply")]
+            return [(str(r.get("reply", "")), bool(r.get("quote", False))) for r in replies if r.get("reply")]
         return []
 
 
 @registrar.on("message")
-async def handle_message(event: Any) -> None:
+async def handle_message(event: MessageEvent) -> None:
     is_group = event.message_type == MessageType.GROUP
     # 群聊：群名片(QQ昵称)；私聊：QQ昵称
     # 半角 () 包裹 QQ 昵称，名字内的半角括号用 \ 转义
@@ -141,7 +167,7 @@ async def handle_message(event: Any) -> None:
             nickname = f"{_escape_parens(card)}({_escape_parens(qq_name)})"
         else:
             nickname = _escape_parens(qq_name)
-        gender = getattr(event.sender, "sex", "") or ""
+        gender = event.sender.sex or ""
     else:
         qq_name = event.sender.nickname or event.user_id
         nickname = _escape_parens(qq_name)
@@ -162,7 +188,7 @@ async def handle_message(event: Any) -> None:
     # 获取群信息
     group_info = await get_group_info(event) if is_group else None
     sender_id = str(event.user_id)
-    raw_time = getattr(event, "time", None) or getattr(event, "message_time", None)
+    raw_time = event.time
     if raw_time:
         try:
             message_time = datetime.fromtimestamp(int(raw_time)).strftime("%Y-%m-%d %H:%M")

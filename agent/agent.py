@@ -22,12 +22,13 @@ import re
 import ast
 import asyncio
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import TypedDict, cast
 import httpx
 import traceback
 from aiohttp import web
 from dotenv import load_dotenv
 from mem0 import Memory
+from mem0 import Mem0Memory
 from mem0.configs.base import MemoryConfig
 from mem0.llms.configs import LlmConfig
 from mem0.embeddings.configs import EmbedderConfig
@@ -38,14 +39,201 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 # ── 类型定义 ──────────────────────────────────────────────
 
-# 情感事件：{"start_at", "end_at", "event", "emotion"}
-EmotionEvent = dict[str, Any]
-# 单用户情感数据：{"display_name", "summary_before_30d", "current_emotion", "emotion_trend", "emotion_history", "logs", "updated_at"}
-EmotionUser = dict[str, Any]
-# emotions.json 顶层：{"schema_version", "updated_at", "users"}
-EmotionData = dict[str, Any]
-# 对话历史单条：{"role", "content", "ts", "sender_id", "nickname", "person_id"}
-HistoryMsg = dict[str, Any]
+
+class EmotionEvent(TypedDict):
+    start_at: str
+    end_at: str
+    event: str
+    emotion: str
+
+
+class EmotionHistoryEntry(TypedDict):
+    at: str
+    emotion: str
+    trend: str
+
+
+class EmotionUser(TypedDict, total=False):
+    display_name: str
+    summary_before_30d: str
+    current_emotion: str
+    emotion_trend: str
+    emotion_history: list[EmotionHistoryEntry]
+    logs: list[EmotionEvent]
+    updated_at: str
+
+
+class EmotionData(TypedDict):
+    schema_version: int
+    updated_at: str
+    users: dict[str, EmotionUser]
+
+
+class HistoryMsg(TypedDict, total=False):
+    role: str
+    content: str
+    ts: str
+    sender_id: str
+    nickname: str
+    person_id: str
+    qq_name: str
+    group_card: str
+
+
+class MemMetadata(TypedDict, total=False):
+    """Mem0 记忆元数据。值类型取决于来源，常见 spoken_by 为 list[str]。"""
+    spoken_by: list[str]
+    user_id: str
+
+
+class MemSearchItem(TypedDict, total=False):
+    """Mem0 搜索结果条目。total=False 因为字段取决于 Mem0 版本和搜索模式。"""
+    id: str
+    memory: str
+    user_id: str
+    agent_id: str
+    run_id: str
+    score: float
+    created_at: str
+    updated_at: str
+    metadata: MemMetadata
+
+
+class Mem0Diag(TypedDict, total=False):
+    query: str
+    candidates: int
+    emb_min: float
+    emb_max: float
+    emb_avg: float
+    qualified: int
+    dropped_emb: int
+    rerank_count: int
+    rerank_min: float
+    rerank_max: float
+    passed: int
+    dropped_rerank: int
+    deduped_rerank: int
+    invalid_rerank_indexes: int
+    emb_candidates: list[dict[str, object]]
+    rerank_candidates: list[dict[str, object]]
+    round: int
+    round_query: str
+
+
+class ToolCallFunction(TypedDict):
+    name: str
+    arguments: str
+
+
+class ToolCall(TypedDict):
+    id: str
+    function: ToolCallFunction
+
+
+class RerankResult(TypedDict, total=False):
+    """硅基流动 Reranker 返回的单条结果。"""
+    index: int
+    relevance_score: float
+
+
+class GroupInfo(TypedDict, total=False):
+    """群信息（adapter 实时查询注入）。"""
+    member_count: int
+    owner_name: str
+    admin_names: list[str]
+
+
+class ChatRequestBody(TypedDict, total=False):
+    """/chat 请求体。total=False：user_id/message 虽必填但用 .get 统一访问。"""
+    user_id: str
+    nickname: str
+    message: str
+    is_direct: bool
+    mentioned: bool
+    gender: str
+    sender_id: str
+    message_time: str
+    qq_name: str
+    group_card: str
+    bot_name: str
+    bot_qq: str
+    group_info: GroupInfo
+
+
+class EmotionEventInput(TypedDict, total=False):
+    """情感事件输入（WebUI 手动添加/修改时传入）。"""
+    start_at: str
+    end_at: str
+    event: str
+    emotion: str
+    dimension: str
+    valence: str
+    impact: int
+    person_id: str
+    display_name: str
+    index: int
+
+
+class EmotionUpdateItem(TypedDict, total=False):
+    """EMOTION_PROMPT 输出的单条更新（_update_emotions 解析）。"""
+    display_name: str
+    person_id: str
+    sender_id: str
+    current_emotion: str
+    emotion_trend: str
+    events: list[EmotionEventInput]
+
+
+class DeepSeekMessage(TypedDict, total=False):
+    """DeepSeek chat-completion 返回的 message 对象。"""
+    role: str
+    content: str
+    tool_calls: list[ToolCall]
+
+
+class ToolProperty(TypedDict, total=False):
+    type: str
+    description: str
+
+
+class ToolFunctionParameters(TypedDict, total=False):
+    type: str
+    properties: dict[str, ToolProperty]
+    required: list[str]
+
+
+class ToolFunctionDef(TypedDict):
+    name: str
+    description: str
+    parameters: ToolFunctionParameters
+
+
+class ToolDef(TypedDict):
+    type: str
+    function: ToolFunctionDef
+
+
+class ToolResponse(TypedDict):
+    role: str
+    tool_call_id: str
+    content: str
+
+
+class UserCtx(TypedDict, total=False):
+    """search_memories 诊断日志附带的用户上下文。"""
+    nickname: str
+    message: str
+    user_id: str
+
+
+class Mem0LogEntry(TypedDict, total=False):
+    """_mem0_log 环形缓冲的单条日志条目（含多轮诊断）。"""
+    ts: str
+    rounds: list[Mem0Diag]
+    total: int
+    nickname: str
+    message: str
+    user_id: str
 
 
 # ── 配置 ────────────────────────────────────────────────
@@ -115,7 +303,7 @@ LOCAL_TZ = timezone(timedelta(hours=8))  # 北京时间
 def _load_settlements() -> dict[str, str]:
     if os.path.exists(SETTLE_FILE):
         with open(SETTLE_FILE, encoding="utf-8") as f:
-            return json.load(f)
+            return cast(dict[str, str], json.load(f))
     return {}
 
 
@@ -138,10 +326,13 @@ def _load_emotions() -> EmotionData:
     if os.path.exists(EMOTIONS_FILE):
         try:
             with open(EMOTIONS_FILE, encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict) and isinstance(data.get("users"), dict):
-                data.setdefault("schema_version", 1)
-                data.setdefault("updated_at", "")
+                data = cast(EmotionData, json.load(f))
+            users = data.get("users") or {}
+            if users:
+                if "schema_version" not in data:
+                    data["schema_version"] = 1
+                if "updated_at" not in data:
+                    data["updated_at"] = ""
                 return data
         except Exception as e:
             print(f"[Emotion] 读取失败: {e}")
@@ -151,7 +342,8 @@ def _load_emotions() -> EmotionData:
 def _save_emotions(data: EmotionData) -> None:
     data["schema_version"] = 1
     data["updated_at"] = _now_minute()
-    data.setdefault("users", {})
+    if "users" not in data:
+        data["users"] = {}
     with open(EMOTIONS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -185,9 +377,14 @@ def _sort_emotion_users(users: dict[str, EmotionUser], session_id: str) -> list[
     items = list(users.items())
     current = [it for it in items if _session_rank(it[0], session_id) == 0]
     other = [it for it in items if _session_rank(it[0], session_id) != 0]
-    key = lambda kv: (str(kv[1].get("updated_at") or ""), 1 if kv[1].get("summary_before_30d") else 0)
-    current.sort(key=key, reverse=True)
-    other.sort(key=key, reverse=True)
+
+    def _sort_key(kv: tuple[str, EmotionUser]) -> tuple[str, int]:
+        ua = kv[1].get("updated_at") or ""
+        sb = kv[1].get("summary_before_30d") or ""
+        return (ua, 1 if sb else 0)
+
+    current.sort(key=_sort_key, reverse=True)
+    other.sort(key=_sort_key, reverse=True)
     return current + other
 
 
@@ -204,22 +401,20 @@ def _format_emotions_for_prompt(session_id: str) -> str:
         trend = str(user.get("emotion_trend") or "stable")
         trend_display = {"up": "↑", "stable": "→", "down": "↓"}.get(trend, "→")
         # 情感变化轨迹
-        history_parts = []
+        history_parts: list[str] = []
         for h in list(user.get("emotion_history") or []):
-            if isinstance(h, dict):
-                at = str(h.get("at") or "")[5:16]  # "2026-06-05 12:02" → "06-05 12:02"
-                em = str(h.get("emotion") or "")
-                tr = str(h.get("trend") or "stable")
-                tr_sym = {"up": "↑", "stable": "→", "down": "↓"}.get(tr, "→")
-                history_parts.append(f"{at} {em} {tr_sym}")
+            at = str(h.get("at") or "")[5:16]  # "2026-06-05 12:02" → "06-05 12:02"
+            em = str(h.get("emotion") or "")
+            tr = str(h.get("trend") or "stable")
+            tr_sym = {"up": "↑", "stable": "→", "down": "↓"}.get(tr, "→")
+            history_parts.append(f"{at} {em} {tr_sym}")
         history_text = "<br>".join(history_parts) or "无"
         # 近期事件
-        parts = []
+        parts: list[str] = []
         logs = list(user.get("logs") or [])
         logs.sort(key=_event_time_key, reverse=True)
         for event in logs:
-            if isinstance(event, dict):
-                parts.append(_format_event(event))
+            parts.append(_format_event(event))
         summary = str(user.get("summary_before_30d") or "").strip()
         if summary:
             parts.append(f"30天前摘要：{summary}")
@@ -232,14 +427,19 @@ def _format_emotions_for_prompt(session_id: str) -> str:
 
 def _emotions_json() -> EmotionData:
     data = _load_emotions()
-    data["users"] = dict(data.get("users") or {})
+    users = data.get("users") or {}
+    data["users"] = dict(users)
     return data
 
 
 def _emotion_upsert_user(person_id: str, display_name: str, summary_before_30d: str = "") -> EmotionUser:
     data = _load_emotions()
-    users = data.setdefault("users", {})
-    user = users.setdefault(person_id, {"display_name": display_name, "summary_before_30d": "", "current_emotion": "", "emotion_trend": "stable", "emotion_history": [], "logs": []})
+    if "users" not in data:
+        data["users"] = {}
+    users = data["users"]
+    if person_id not in users:
+        users[person_id] = {"display_name": display_name, "summary_before_30d": "", "current_emotion": "", "emotion_trend": "stable", "emotion_history": [], "logs": []}
+    user = users[person_id]
     user["display_name"] = display_name or user.get("display_name") or person_id
     if summary_before_30d:
         user["summary_before_30d"] = summary_before_30d
@@ -248,13 +448,17 @@ def _emotion_upsert_user(person_id: str, display_name: str, summary_before_30d: 
     return user
 
 
-def _emotion_add_event(person_id: str, display_name: str, event: dict[str, Any]) -> EmotionEvent:
+def _emotion_add_event(person_id: str, display_name: str, event: EmotionEventInput) -> EmotionEvent:
     data = _load_emotions()
-    users = data.setdefault("users", {})
-    user = users.setdefault(person_id, {"display_name": display_name, "summary_before_30d": "", "current_emotion": "", "emotion_trend": "stable", "emotion_history": [], "logs": []})
+    if "users" not in data:
+        data["users"] = {}
+    users = data["users"]
+    if person_id not in users:
+        users[person_id] = {"display_name": display_name, "summary_before_30d": "", "current_emotion": "", "emotion_trend": "stable", "emotion_history": [], "logs": []}
+    user = users[person_id]
     user["display_name"] = display_name or user.get("display_name") or person_id
-    logs = user.setdefault("logs", [])
-    item = {
+    logs = user.get("logs") or []
+    item: EmotionEvent = {
         "start_at": str(event.get("start_at") or _now_minute()),
         "end_at": str(event.get("end_at") or event.get("start_at") or _now_minute()),
         "event": str(event.get("event") or "").strip(),
@@ -262,18 +466,19 @@ def _emotion_add_event(person_id: str, display_name: str, event: dict[str, Any])
     }
     if item["event"] or item["emotion"]:
         logs.append(item)
+    user["logs"] = logs
     logs.sort(key=_event_time_key, reverse=True)
     user["updated_at"] = _now_minute()
     _save_emotions(data)
     return item
 
 
-def _emotion_update_event(person_id: str, index: int, event: dict[str, Any]) -> EmotionEvent:
+def _emotion_update_event(person_id: str, index: int, event: EmotionEventInput) -> EmotionEvent:
     data = _load_emotions()
-    user = data.get("users", {}).get(person_id)
+    user = data["users"].get(person_id)
     if not user:
         raise ValueError("person not found")
-    logs = user.setdefault("logs", [])
+    logs = user.get("logs") or []
     if index < 0 or index >= len(logs):
         raise ValueError("event not found")
     logs[index] = {
@@ -282,6 +487,7 @@ def _emotion_update_event(person_id: str, index: int, event: dict[str, Any]) -> 
         "event": str(event.get("event") or "").strip(),
         "emotion": str(event.get("emotion") or "").strip(),
     }
+    user["logs"] = logs
     logs.sort(key=_event_time_key, reverse=True)
     user["updated_at"] = _now_minute()
     _save_emotions(data)
@@ -290,15 +496,18 @@ def _emotion_update_event(person_id: str, index: int, event: dict[str, Any]) -> 
 
 def _emotion_delete(person_id: str, index: int | None = None) -> None:
     data = _load_emotions()
-    users = data.setdefault("users", {})
+    if "users" not in data:
+        data["users"] = {}
+    users = data["users"]
     if person_id not in users:
         return
     if index is None:
         users.pop(person_id, None)
     else:
-        logs = users[person_id].setdefault("logs", [])
+        logs = users[person_id].get("logs") or []
         if 0 <= index < len(logs):
             logs.pop(index)
+            users[person_id]["logs"] = logs
             users[person_id]["updated_at"] = _now_minute()
     _save_emotions(data)
 
@@ -336,15 +545,17 @@ def _parse_dt(text: str | None) -> datetime | None:
 _mem0_lock: asyncio.Lock = asyncio.Lock()
 
 # Mem0 搜索日志（环形缓冲，供 /mem0 WebUI 查看）
-_mem0_log: list[dict[str, Any]] = []
+_mem0_log: list[Mem0LogEntry] = []
 _MEM0_LOG_MAX: int = 200
-_last_mem0_diag: dict[str, Any] | None = None
+_last_mem0_diag: Mem0Diag | None = None
 
 # 加载持久化日志
 if os.path.exists(MEM0_LOG_FILE):
     try:
         with open(MEM0_LOG_FILE, encoding="utf-8") as f:
-            _mem0_log = json.load(f)[:_MEM0_LOG_MAX]
+            _raw_log: object = json.load(f)
+            if isinstance(_raw_log, list):
+                _mem0_log = cast(list[Mem0LogEntry], _raw_log[:_MEM0_LOG_MAX])
     except Exception as e:
         print(f"[Mem0] 日志加载失败: {e}")
 
@@ -378,8 +589,17 @@ def _mem_delete(memory_id: str) -> None:
     _memory.delete(memory_id)
 
 
-def _split_spoken_by(spoken_by: str | list | tuple | None) -> list[str]:
+def _str_list(x: object) -> list[str]:
+    """安全地将未知值转为 list[str]。"""
+    if isinstance(x, list):
+        items = cast(list[object], x)
+        return [str(i) for i in items]
+    return []
+
+
+def _split_spoken_by(spoken_by: str | list[str] | tuple[str, ...] | None) -> list[str]:
     """把来源统一存成数组；字符串优先按 Python 字面量解析。"""
+    parts: list[str] = []
     if isinstance(spoken_by, (list, tuple)):
         parts = [str(x).strip() for x in spoken_by]
     else:
@@ -387,11 +607,12 @@ def _split_spoken_by(spoken_by: str | list | tuple | None) -> list[str]:
         if not text:
             return []
         try:
-            value = ast.literal_eval(text)
+            value: object = ast.literal_eval(text)
             if isinstance(value, str):
                 parts = [value.strip()]
             elif isinstance(value, (list, tuple)):
-                parts = [str(x).strip() for x in value]
+                parts = _str_list(cast(object, value))
+                parts = [p.strip() for p in parts]
             else:
                 parts = [text]
         except (SyntaxError, ValueError):
@@ -399,13 +620,13 @@ def _split_spoken_by(spoken_by: str | list | tuple | None) -> list[str]:
     return [p for p in parts if p]
 
 
-def _format_spoken_by(spoken_by: str | list | tuple | None) -> str:
+def _format_spoken_by(spoken_by: str | list[str] | tuple[str, ...] | None) -> str:
     """把来源数组格式化给提示词/日志显示。"""
     sources = _split_spoken_by(spoken_by)
     return "、".join(sources) if sources else "未知"
 
 
-def _mem_add(memory: str, user_id: str, spoken_by: str = "手动添加") -> dict:
+def _mem_add(memory: str, user_id: str, spoken_by: str = "手动添加") -> Mem0Memory:
     """同步新增记忆（在锁内调用）"""
     return _memory.add(
         memory,
@@ -417,10 +638,15 @@ def _mem_add(memory: str, user_id: str, spoken_by: str = "手动添加") -> dict
 
 
 def _mem_update(memory_id: str, memory: str, user_id: str | None = None,
-                spoken_by: str | None = None) -> dict:
+                spoken_by: str | None = None) -> Mem0Memory:
     """同步更新记忆（在锁内调用）"""
     old = _memory.get(memory_id)
-    metadata = dict((old or {}).get("metadata") or {})
+    old_metadata: MemMetadata = {}
+    if old:
+        md = old.get("metadata")
+        if md:
+            old_metadata = md
+    metadata: MemMetadata = {**old_metadata}
     if user_id:
         metadata["user_id"] = user_id
     if spoken_by is not None:
@@ -428,43 +654,53 @@ def _mem_update(memory_id: str, memory: str, user_id: str | None = None,
     return _memory.update(memory_id, memory, metadata=metadata)
 
 
-def _mem_get_all(user_id: str | None = None, limit: int = 500) -> list[dict]:
+def _mem_get_all(user_id: str | None = None, limit: int = 500) -> list[MemSearchItem]:
     """获取所有记忆（同步）"""
     try:
         if user_id:
-            items = _memory.get_all(filters={"user_id": user_id})
+            raw_result = _memory.get_all(filters={"user_id": user_id})
+            # Mem0 API 可能返回 dict 含 "results" 键，或直接返回 list
+            if isinstance(raw_result, dict):
+                val = raw_result.get("results", [])
+            else:
+                val = raw_result
+            items = cast(list[MemSearchItem], val)
+            return items[:limit]
         else:
             # 从 Qdrant 直接拉全部向量，再拼接记忆文本
             vs = _memory.vector_store
-            rows = vs.list(filters=None, top_k=limit)
-            if isinstance(rows, tuple):
-                rows = rows[0] if rows else []
-            items = []
-            for row in (rows or []):
-                payload = getattr(row, "payload", None) or {}
-                metadata = {k: v for k, v in payload.items() if k not in {
-                    "data", "hash", "created_at", "updated_at", "id", "text_lemmatized",
-                    "user_id", "agent_id", "run_id", "actor_id", "role", "attributed_to",
-                }}
+            raw_rows_out = vs.list(filters=None, top_k=limit)
+            # vs.list 可能返回 tuple(list, ...) 或 list
+            if isinstance(raw_rows_out, tuple):
+                raw_rows = cast(list[object], raw_rows_out[0] if raw_rows_out else [])
+            else:
+                raw_rows = cast(list[object], raw_rows_out)
+            items: list[MemSearchItem] = []
+            for row in raw_rows:
+                payload: dict[str, object] = getattr(row, "payload", None) or {}
+                metadata = cast(MemMetadata, {
+                    k: v for k, v in payload.items() if k not in {
+                        "data", "hash", "created_at", "updated_at", "id", "text_lemmatized",
+                        "user_id", "agent_id", "run_id", "actor_id", "role", "attributed_to",
+                    }
+                })
                 items.append({
-                    "id": getattr(row, "id", ""),
-                    "memory": payload.get("data", ""),
-                    "user_id": payload.get("user_id", ""),
-                    "agent_id": payload.get("agent_id", ""),
-                    "run_id": payload.get("run_id", ""),
-                    "created_at": payload.get("created_at", ""),
-                    "updated_at": payload.get("updated_at", ""),
+                    "id": str(getattr(row, "id", "")),
+                    "memory": str(payload.get("data", "")),
+                    "user_id": str(payload.get("user_id", "")),
+                    "agent_id": str(payload.get("agent_id", "")),
+                    "run_id": str(payload.get("run_id", "")),
+                    "created_at": str(payload.get("created_at", "")),
+                    "updated_at": str(payload.get("updated_at", "")),
                     "metadata": metadata,
                 })
-        if isinstance(items, dict):
-            items = items.get("results", [])
-        return (items or [])[:limit]
+        return items[:limit]
     except Exception as e:
         print(f"[Mem0] get_all 异常: {e}")
         return []
 
 
-def _siliconflow_rerank(query: str, documents: list[str]) -> list[dict[str, Any]]:
+def _siliconflow_rerank(query: str, documents: list[str]) -> list[RerankResult]:
     """调硅基流动 Reranker API 重排所有文档（同步）"""
     if not documents:
         return []
@@ -481,13 +717,17 @@ def _siliconflow_rerank(query: str, documents: list[str]) -> list[dict[str, Any]
                 },
             )
             resp.raise_for_status()
-            return resp.json().get("results", [])
+            data = cast(dict[str, object], resp.json())
+            raw = data.get("results", [])
+            if not isinstance(raw, list):
+                return []
+            return cast(list[RerankResult], raw)
     except Exception as e:
         print(f"[Reranker] 重排失败: {e}")
         return []
 
 
-def _mem_count(filters: dict[str, Any] | None = None) -> int:
+def _mem_count(filters: dict[str, str] | None = None) -> int:
     """返回当前过滤条件下的记忆总数，用作检索数量，避免人为截断。"""
     try:
         vs = _memory.vector_store
@@ -503,29 +743,34 @@ def _mem_count(filters: dict[str, Any] | None = None) -> int:
         return 0
 
 
-def _mem_search(query: str) -> dict[str, Any]:
+def _mem_search(query: str) -> dict[str, list[MemSearchItem]]:
     """跨用户检索记忆：海选(Embedding分) → 选拔(Reranker分)，双门槛全入围"""
     global _last_mem0_diag
     clean = re.sub(r"\[CQ:\w+,.*?\]", "", query).strip()
     if not clean:
         clean = query
     try:
-        filters = {"user_id": "*"}
+        filters: dict[str, str] = {"user_id": "*"}
         total_memories = _mem_count(filters)
         if total_memories <= 0:
             return {"results": []}
 
         # 海选：Embedding 粗筛，不再设置固定候选上限，按当前记忆库总量取回。
-        result = _memory.search(clean, filters=filters, top_k=total_memories)
-        items = result.get("results", [])
+        raw_result = _memory.search(clean, filters=filters, top_k=total_memories)
+        # Mem0 API 返回 dict 含 "results" 键，或直接返回 list
+        if isinstance(raw_result, dict):
+            results_val = raw_result.get("results", [])
+        else:
+            results_val = raw_result
+        items = cast(list[MemSearchItem], results_val)
         if not items:
-            return result
+            return {"results": []}
 
         # 海选：统计 Embedding 分数分布
-        emb_scores = [item.get("score", 0) for item in items]
+        emb_scores: list[float] = [float(item.get("score", 0)) for item in items]
         print(f"[Reranker] 海选 {len(items)} 条, Embedding分 min={min(emb_scores):.3f} max={max(emb_scores):.3f} avg={sum(emb_scores)/len(emb_scores):.3f}")
 
-        qualified = [item for item in items if item.get("score", 0) >= RERANK_MIN_SIMILARITY]
+        qualified: list[MemSearchItem] = [item for item in items if float(item.get("score", 0)) >= RERANK_MIN_SIMILARITY]
         dropped = len(items) - len(qualified)
         if dropped > 0:
             print(f"[Reranker] 海选淘汰 {dropped} 条 (<{RERANK_MIN_SIMILARITY})")
@@ -534,68 +779,68 @@ def _mem_search(query: str) -> dict[str, Any]:
 
         # 太少了不值得重排
         if len(qualified) <= 2:
-            result["results"] = qualified
-            return result
+            return {"results": qualified}
 
         # 选拔：Reranker 精排
-        docs = [item.get("memory", "") for item in qualified]
-        rerank_results = _siliconflow_rerank(clean, docs)
+        docs: list[str] = [str(item.get("memory", "")) for item in qualified]
+        rerank_results: list[RerankResult] = _siliconflow_rerank(clean, docs)
 
         if not rerank_results:
-            result["results"] = qualified
-            return result
+            return {"results": qualified}
 
         # Reranker 偶尔会返回重复 index；同一候选只保留最高分，避免 WebUI 和最终结果重复显示。
-        best_by_index: dict[int, dict[str, Any]] = {}
+        best_by_index: dict[int, RerankResult] = {}
         invalid_rerank_indexes = 0
         for rr in rerank_results:
-            idx: Any = rr.get("index")
+            idx_raw = rr.get("index")
+            idx: int | None = None
+            if idx_raw is not None:
+                try:
+                    idx = int(idx_raw)
+                except (TypeError, ValueError):
+                    invalid_rerank_indexes += 1
+                    continue
             if idx is None:
-                invalid_rerank_indexes += 1
-                continue
-            try:
-                idx = int(idx)
-            except (TypeError, ValueError):
                 invalid_rerank_indexes += 1
                 continue
             if not (0 <= idx < len(qualified)):
                 invalid_rerank_indexes += 1
                 continue
 
-            score = rr.get("relevance_score", 0)
+            score: float = float(rr.get("relevance_score", 0))
             old = best_by_index.get(idx)
-            if old is None or score > old.get("relevance_score", 0):
-                item = dict(rr)
-                item["index"] = idx
-                best_by_index[idx] = item
+            if old is None or score > float(old.get("relevance_score", 0)):
+                rr_item = cast(RerankResult, dict(rr))
+                rr_item["index"] = idx
+                best_by_index[idx] = rr_item
 
         duplicate_rerank_indexes = len(rerank_results) - invalid_rerank_indexes - len(best_by_index)
         if duplicate_rerank_indexes > 0:
             print(f"[Reranker] 去重重复 index {duplicate_rerank_indexes} 条")
 
-        rerank_results = sorted(
+        sorted_reranks: list[RerankResult] = sorted(
             best_by_index.values(),
-            key=lambda rr: rr.get("relevance_score", 0),
+            key=lambda r: float(r.get("relevance_score", 0)),
             reverse=True,
         )
 
         # 双门槛：Reranker 分 ≥ 选拔分 的才入围
-        final = []
-        failed = []
-        for rr in rerank_results:
-            score: float = float(rr.get("relevance_score", 0))
-            ri: int = int(rr.get("index", -1))
+        final: list[MemSearchItem] = []
+        failed: list[tuple[float, str]] = []
+        for rr in sorted_reranks:
+            score = float(rr.get("relevance_score", 0))
+            ri = int(rr.get("index", -1))
             if ri < 0 or ri >= len(qualified):
                 continue
             if score < RERANK_MIN_RELEVANCE:
-                failed.append((score, qualified[ri].get("memory", "")[:30]))
+                failed.append((score, str(qualified[ri].get("memory", ""))[:30]))
                 continue
-            item = dict(qualified[ri])
+            item: MemSearchItem = {**qualified[ri]}
             item["score"] = score
             final.append(item)
 
         # 选拔：统计 Reranker 分数分布
-        all_rerank = [rr.get("relevance_score", 0) for rr in rerank_results]
+        all_rerank: list[float] = [float(r.get("relevance_score", 0)) for r in sorted_reranks]
         if all_rerank:
             print(f"[Reranker] 选拔 {len(all_rerank)} 条, Reranker分 min={min(all_rerank):.3f} max={max(all_rerank):.3f}")
 
@@ -604,10 +849,8 @@ def _mem_search(query: str) -> dict[str, Any]:
             for s, txt in failed[:5]:
                 print(f"  [{s:.3f}] {txt}...")
 
-        result["results"] = final
-
         # 记录诊断数据
-        _last_mem0_diag = {
+        _last_mem0_diag = cast(Mem0Diag, {
             "query": clean,
             "candidates": len(items),
             "emb_min": round(min(emb_scores), 3),
@@ -622,25 +865,25 @@ def _mem_search(query: str) -> dict[str, Any]:
             "dropped_rerank": len(failed),
             "deduped_rerank": duplicate_rerank_indexes,
             "invalid_rerank_indexes": invalid_rerank_indexes,
-            "emb_candidates": [{
+            "emb_candidates": cast(list[dict[str, object]], [{
                 "id": item.get("id", ""),
-                "memory": item.get("memory", "")[:80],
-                "score": round(item.get("score", 0), 3),
-                "passed": item.get("score", 0) >= RERANK_MIN_SIMILARITY,
-            } for item in items],
-            "rerank_candidates": [
+                "memory": str(item.get("memory", ""))[:80],
+                "score": round(float(item.get("score", 0)), 3),
+                "passed": float(item.get("score", 0)) >= RERANK_MIN_SIMILARITY,
+            } for item in items]),
+            "rerank_candidates": cast(list[dict[str, object]], [
                 {
                     "id": qualified[ri2].get("id", ""),
-                    "memory": qualified[ri2].get("memory", "")[:80],
-                    "rerank_score": round(rr.get("relevance_score", 0), 3),
-                    "emb_score": round(qualified[ri2].get("score", 0), 3),
-                    "passed": rr.get("relevance_score", 0) >= RERANK_MIN_RELEVANCE,
+                    "memory": str(qualified[ri2].get("memory", ""))[:80],
+                    "rerank_score": round(float(rr.get("relevance_score", 0)), 3),
+                    "emb_score": round(float(qualified[ri2].get("score", 0)), 3),
+                    "passed": float(rr.get("relevance_score", 0)) >= RERANK_MIN_RELEVANCE,
                 }
-                for rr in rerank_results
+                for rr in sorted_reranks
                 if 0 <= (ri2 := int(rr.get("index", -1))) < len(qualified)
-            ],
-        }
-        return result
+            ]),
+        })
+        return {"results": final}
     except Exception as e:
         print(f"[Mem0] search 异常: {e}")
         _last_mem0_diag = None
@@ -728,7 +971,7 @@ EMOTION_ROLLUP_PROMPT = (
 
 
 def _history_text(history: list[HistoryMsg]) -> str:
-    user_msgs = [h for h in history if h["role"] == "user"]
+    user_msgs = [h for h in history if h.get("role") == "user"]
     lines: list[str] = []
     for h in user_msgs:
         content = h.get("content", "")
@@ -769,25 +1012,29 @@ async def _call_deepseek_for_settle(system_prompt: str, history: list[HistoryMsg
     return await _call_deepseek_text(system_prompt, text, tag, model=SETTLE_MODEL)
 
 
-def _extract_json_array(text: str) -> list[Any] | None:
+def _extract_json_array(text: str) -> list[EmotionUpdateItem] | None:
     raw = text.strip()
     try:
-        value = json.loads(raw)
-        return value if isinstance(value, list) else None
+        value: object = json.loads(raw)
+        if isinstance(value, list):
+            return cast(list[EmotionUpdateItem], value)
+        return None
     except json.JSONDecodeError:
         pass
     start = raw.find("[")
     end = raw.rfind("]")
     if start >= 0 and end > start:
         try:
-            value = json.loads(raw[start:end + 1])
-            return value if isinstance(value, list) else None
+            value2: object = json.loads(raw[start:end + 1])
+            if isinstance(value2, list):
+                return cast(list[EmotionUpdateItem], value2)
+            return None
         except json.JSONDecodeError:
             return None
     return None
 
 
-async def _json_array_with_repair(text: str, tag: str) -> list[Any] | None:
+async def _json_array_with_repair(text: str, tag: str) -> list[EmotionUpdateItem] | None:
     current = text
     for attempt in range(5):
         value = _extract_json_array(current)
@@ -802,10 +1049,10 @@ async def _json_array_with_repair(text: str, tag: str) -> list[Any] | None:
 
 
 async def _rollup_emotion_user(user: EmotionUser) -> None:
-    logs = [e for e in user.get("logs", []) if isinstance(e, dict)]
+    logs: list[EmotionEvent] = user.get("logs") or []
     cutoff = datetime.now(LOCAL_TZ) - timedelta(days=EMOTION_RECENT_DAYS)
-    recent = []
-    expired = []
+    recent: list[EmotionEvent] = []
+    expired: list[EmotionEvent] = []
     for event in logs:
         dt = _parse_dt(event.get("start_at") or event.get("end_at"))
         if dt and dt.tzinfo is None:
@@ -861,10 +1108,10 @@ async def _update_emotions(history: list[HistoryMsg], session_id: str) -> None:
     today = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
 
     data = _load_emotions()
-    users = data.setdefault("users", {})
+    if "users" not in data:
+        data["users"] = {}
+    users = data["users"]
     for item in updates:
-        if not isinstance(item, dict):
-            continue
         display = str(item.get("display_name") or "").strip()
         pid = str(item.get("person_id") or "").strip()
 
@@ -881,34 +1128,40 @@ async def _update_emotions(history: list[HistoryMsg], session_id: str) -> None:
                 pid = resolved
             else:
                 # 最后兜底：用 _person_id 构造
-                pid = _person_id(session_id, item.get("sender_id"), display)
+                sender_id_raw = item.get("sender_id")
+                pid = _person_id(session_id, str(sender_id_raw) if sender_id_raw else None, display)
 
         if not display:
             display = pid
-        user = users.setdefault(pid, {"display_name": display, "summary_before_30d": "", "current_emotion": "", "emotion_trend": "stable", "emotion_history": [], "logs": []})
+        if pid not in users:
+            users[pid] = {"display_name": display, "summary_before_30d": "", "current_emotion": "", "emotion_trend": "stable", "emotion_history": [], "logs": []}
+        user = users[pid]
         user["display_name"] = display
         # 更新当前情感状态
         ce = str(item.get("current_emotion") or "").strip()
-        et = str(item.get("emotion_trend") or "").strip().lower()
+        et_raw = item.get("emotion_trend")
+        et = str(et_raw or "").strip().lower()
         if et not in ("up", "stable", "down"):
             et = "stable"
-        old_ce = str(user.get("current_emotion") or "").strip()
         if ce:
             # 情感有变化或首次记录 → 追加到 history
-            if ce != old_ce:
-                history_list = user.setdefault("emotion_history", [])
-                history_list.append({"at": _now_minute(), "emotion": ce, "trend": et})
-                # 保留最近 30 条，防止无限增长
-                if len(history_list) > 30:
-                    user["emotion_history"] = history_list[-30:]
+            history_list = list(user.get("emotion_history") or [])
+            history_list.append({"at": _now_minute(), "emotion": ce, "trend": et})
+            # 保留最近 30 条，防止无限增长
+            if len(history_list) > 30:
+                history_list = history_list[-30:]
+            user["emotion_history"] = history_list
             user["current_emotion"] = ce
             user["emotion_trend"] = et
-        logs = user.setdefault("logs", [])
-        for event in item.get("events") or []:
-            if not isinstance(event, dict):
-                continue
-            start = str(event.get("start_at") or _now_minute()).strip()
-            end = str(event.get("end_at") or event.get("start_at") or _now_minute()).strip()
+        logs: list[EmotionEvent] = list(user.get("logs") or [])
+        events_raw = item.get("events")
+        events_list: list[EmotionEventInput] = events_raw if events_raw else []
+        for event in events_list:
+            ev_dict: EmotionEventInput = event
+            start_raw = ev_dict.get("start_at")
+            end_raw = ev_dict.get("end_at")
+            start = str(start_raw or _now_minute()).strip()
+            end = str(end_raw or start_raw or _now_minute()).strip()
             # 补全日期：如果只有时分 (如 "23:13") 则补上当天日期
             if len(start) <= 5 and ":" in start:
                 start = f"{today} {start}"
@@ -917,11 +1170,12 @@ async def _update_emotions(history: list[HistoryMsg], session_id: str) -> None:
             entry: EmotionEvent = {
                 "start_at": start,
                 "end_at": end,
-                "event": str(event.get("event") or "").strip(),
-                "emotion": str(event.get("emotion") or "").strip(),
+                "event": str(ev_dict.get("event") or "").strip(),
+                "emotion": str(ev_dict.get("emotion") or "").strip(),
             }
             if entry["event"] or entry["emotion"]:
                 logs.append(entry)
+        user["logs"] = logs
         logs.sort(key=_event_time_key, reverse=True)
         user["updated_at"] = _now_minute()
         await _rollup_emotion_user(user)
@@ -1034,7 +1288,7 @@ def load_history(user_id: str) -> list[HistoryMsg]:
     path = _session_path(user_id)
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
+            return cast(list[HistoryMsg], json.load(f))
     return []
 
 
@@ -1054,7 +1308,7 @@ def get_history(user_id: str) -> list[HistoryMsg]:
 
 # ── 工具定义 ────────────────────────────────────────────
 
-TOOLS = [
+TOOLS: list[ToolDef] = [
     {
         "type": "function",
         "function": {
@@ -1111,16 +1365,18 @@ TOOLS = [
 ]
 
 
-async def handle_tool_calls(msg: dict[str, Any]) -> tuple[bool, list[dict[str, Any]]]:
+async def handle_tool_calls(msg: DeepSeekMessage) -> tuple[bool, list[ToolResponse]]:
     """解析模型返回的所有工具调用
     返回: (是否引用, [工具响应消息列表])
     """
     quote = False
-    responses = []
+    responses: list[ToolResponse] = []
 
     for tc in msg.get("tool_calls", []):
         name = tc["function"]["name"]
-        args = json.loads(tc["function"].get("arguments", "{}"))
+        args_raw = tc["function"].get("arguments", "{}")
+        args_parsed: object = json.loads(args_raw)
+        args = cast(dict[str, object], args_parsed) if isinstance(args_parsed, dict) else {}
 
         if name == "should_quote":
             quote = True
@@ -1130,7 +1386,7 @@ async def handle_tool_calls(msg: dict[str, Any]) -> tuple[bool, list[dict[str, A
                 "content": "ok",
             })
         elif name == "forget_memory":
-            mid = args.get("memory_id", "")
+            mid = str(args.get("memory_id") or "")
             if mid:
                 try:
                     _mem_delete(mid)
@@ -1142,7 +1398,7 @@ async def handle_tool_calls(msg: dict[str, Any]) -> tuple[bool, list[dict[str, A
                 "content": "已删除",
             })
         elif name == "search_web":
-            query = args.get("query", "")
+            query = str(args.get("query") or "")
             print(f"[Firecrawl] 模型请求搜索: {query}")
             result_text = await _do_web_search(query)
             print(f"[Firecrawl] 搜索结果: {result_text[:100]}...")
@@ -1159,12 +1415,12 @@ async def handle_tool_calls(msg: dict[str, Any]) -> tuple[bool, list[dict[str, A
 
 
 async def search_memories(query: str, max_rounds: int = 2,
-                          capture: bool = False, user_ctx: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+                          capture: bool = False, user_ctx: UserCtx | None = None) -> list[MemSearchItem]:
     """滚雪球记忆检索，直到 id 集合闭合或达到最大轮数"""
     global _last_mem0_diag
-    known: dict[str, dict[str, Any]] = {}
+    known: dict[str, MemSearchItem] = {}
     q: str = query
-    rounds_diag: list[dict[str, Any]] = []
+    rounds_diag: list[Mem0Diag] = []
 
     for _ in range(max_rounds):
         async with _mem0_lock:
@@ -1175,23 +1431,24 @@ async def search_memories(query: str, max_rounds: int = 2,
             if _last_mem0_diag:
                 _last_mem0_diag["round"] = len(rounds_diag) + 1
                 _last_mem0_diag["round_query"] = q[:100]
-                rounds_diag.append(dict(_last_mem0_diag))
+                rounds_diag.append(cast(Mem0Diag, dict(_last_mem0_diag)))
 
-        if not result or not isinstance(result, dict):
+        if not result:
             print(f"[Mem0] 搜索返回异常: {result}")
             break
 
-        print(f"[Mem0] 搜索 '{q[:30]}...' → {len(result.get('results', []))} 条")
-        for item in result.get("results", []):
-            if not item or not isinstance(item, dict):
+        items = result.get("results", [])
+        print(f"[Mem0] 搜索 '{q[:30]}...' → {len(items)} 条")
+        for item in items:
+            if not item:
                 continue
-            score = item.get("score", 0)
-            print(f"  [{item.get('id', '?')[:12]}] {item.get('memory', '')[:60]} ({score:.3f})")
+            score = float(item.get("score", 0))
+            print(f"  [{str(item.get('id', '?'))[:12]}] {str(item.get('memory', ''))[:60]} ({score:.3f})")
         new_count = 0
-        for item in result.get("results", []):
-            if not item or not isinstance(item, dict):
+        for item in items:
+            if not item:
                 continue
-            mid = item.get("id")
+            mid = str(item.get("id", ""))
             if mid and mid not in known:
                 known[mid] = item
                 new_count += 1
@@ -1200,12 +1457,13 @@ async def search_memories(query: str, max_rounds: int = 2,
             break
 
         # 拼接下轮 query
-        parts = [query]
+        parts: list[str] = [query]
         for m in known.values():
-            if not m or not isinstance(m, dict):
+            if not m:
                 continue
             meta = m.get("metadata") or {}
-            spoken_by = _format_spoken_by(meta.get("spoken_by", "未知"))
+            spoken_by_raw = meta.get("spoken_by", "未知")
+            spoken_by = _format_spoken_by(spoken_by_raw)
             parts.append(f"[{spoken_by}] {m.get('memory', '')}")
         q = "\n".join(parts)
         # 限制 query 长度，避免超过 Mem0 的 512 token 限制
@@ -1214,13 +1472,18 @@ async def search_memories(query: str, max_rounds: int = 2,
 
     # 记录到环形缓冲
     if capture and rounds_diag:
-        entry = {
+        entry: Mem0LogEntry = {
             "ts": datetime.now(LOCAL_TZ).isoformat(),
             "rounds": rounds_diag,
             "total": len(known),
         }
         if user_ctx:
-            entry.update(user_ctx)
+            if "nickname" in user_ctx:
+                entry["nickname"] = user_ctx["nickname"]
+            if "message" in user_ctx:
+                entry["message"] = user_ctx["message"]
+            if "user_id" in user_ctx:
+                entry["user_id"] = user_ctx["user_id"]
         _mem0_log.append(entry)
         if len(_mem0_log) > _MEM0_LOG_MAX:
             _mem0_log.pop(0)
@@ -1236,38 +1499,38 @@ async def search_memories(query: str, max_rounds: int = 2,
 # ── 矛盾检测 ────────────────────────────────────────────
 
 
-def detect_conflicts(memories: list[dict[str, Any]]) -> list[str]:
+def detect_conflicts(memories: list[MemSearchItem]) -> list[str]:
     """检测同主题不同 spoken_by 的矛盾记忆"""
-    by_topic: dict[str, list[dict[str, Any]]] = {}
+    by_topic: dict[str, list[MemSearchItem]] = {}
     for m in memories:
-        if not m or not isinstance(m, dict):
+        if not m:
             continue
-        topic = m.get("memory", "")[:10]
+        topic = str(m.get("memory", ""))[:10]
         by_topic.setdefault(topic, []).append(m)
 
-    warnings = []
+    warnings: list[str] = []
     for items in by_topic.values():
-        speakers = {
-            source
-            for it in items
-            for source in _split_spoken_by((it.get("metadata") or {}).get("spoken_by", "?"))
-        }
+        speakers: set[str] = set()
+        for it in items:
+            meta = it.get("metadata") or {}
+            speakers.update(_split_spoken_by(meta.get("spoken_by", "?")))
         if len(speakers) > 1 and len(items) > 1:
-            ids = [it["id"] for it in items]
+            ids = [str(it.get("id", "")) for it in items]
             warnings.append(
                 f"⚠ 以下记忆关于同一主题但来源不同，可能存在矛盾：{', '.join(ids)}"
             )
     return warnings
 
 
-def format_memories(memories: list[dict[str, Any]]) -> str:
+def format_memories(memories: list[MemSearchItem]) -> str:
     """格式化记忆列表"""
-    lines = []
+    lines: list[str] = []
     for m in memories:
-        if not m or not isinstance(m, dict):
+        if not m:
             continue
         meta = m.get("metadata") or {}
-        spoken_by = _format_spoken_by(meta.get("spoken_by", "未知"))
+        spoken_by_raw = meta.get("spoken_by", "未知")
+        spoken_by = _format_spoken_by(spoken_by_raw)
         created = str(m.get("created_at", ""))[:10]
         lines.append(f"[{m.get('id', '?')}] [{spoken_by}] {m.get('memory', '')}（{created}）")
     return "\n".join(lines)
@@ -1278,7 +1541,7 @@ def format_memories(memories: list[dict[str, Any]]) -> str:
 
 async def call_deepseek(
     user_id: str, nickname: str, message: str, is_direct: bool, bot_name: str = "",
-    group_info: dict[str, Any] | None = None, mentioned: bool = False, gender: str = "",
+    group_info: GroupInfo | None = None, mentioned: bool = False, gender: str = "",
     sender_id: str = "", message_time: str = "",
     qq_name: str = "", group_card: str = "",
 ) -> list[tuple[str, bool]]:
@@ -1286,7 +1549,7 @@ async def call_deepseek(
     history = get_history(user_id)
 
     # 1. 记忆检索
-    memories: list[dict[str, Any]] = []
+    memories: list[MemSearchItem] = []
     try:
         memories = await search_memories(message, capture=True,
             user_ctx={"nickname": nickname, "message": message, "user_id": user_id})
@@ -1339,9 +1602,9 @@ async def call_deepseek(
             f"\n（群聊消息。你觉得能说上话就回，插不上嘴就输出 NO_REPLY）"
         )
 
-    messages = [
+    messages: list[dict[str, object]] = [
         {"role": "system", "content": system},
-        *history,
+        *cast(list[dict[str, object]], history),
         {"role": "user", "content": user_msg},
     ]
 
@@ -1354,8 +1617,8 @@ async def call_deepseek(
             json={"model": MODEL, "messages": messages, "tools": TOOLS},
         )
         resp.raise_for_status()
-        choice = resp.json()["choices"][0]
-        msg = choice["message"]
+        choice = cast(dict[str, object], resp.json()["choices"][0])
+        msg = cast(DeepSeekMessage, choice["message"])
 
         quote, tool_responses = await handle_tool_calls(msg)
 
@@ -1363,17 +1626,20 @@ async def call_deepseek(
 
         if tool_responses:
             # 模型调工具前说的自然语言也发出去
-            if msg.get("content"):
-                replies.append((msg["content"], quote))
+            content = msg.get("content")
+            if content:
+                replies.append((content, quote))
             # 第二轮
-            messages.append(msg)
-            messages.extend(tool_responses)
+            messages.append(cast(dict[str, object], msg))
+            messages.extend(cast(list[dict[str, object]], tool_responses))
             resp2 = await client.post(
                 DEEPSEEK_URL, headers=headers,
                 json={"model": MODEL, "messages": messages},
             )
             resp2.raise_for_status()
-            reply = resp2.json()["choices"][0]["message"]["content"]
+            choice2 = cast(dict[str, object], resp2.json()["choices"][0])
+            msg2 = cast(DeepSeekMessage, choice2["message"])
+            reply = msg2.get("content") or ""
         else:
             reply = msg.get("content") or ""
         replies.append((reply, quote))
@@ -1425,10 +1691,10 @@ async def call_deepseek(
 
 
 async def chat(request: web.Request) -> web.Response:
-    body = await request.json()
-    user_id = body["user_id"]
-    nickname = body.get("nickname", user_id)
-    message = body["message"]
+    body = cast(ChatRequestBody, await request.json())
+    user_id = body.get("user_id", "")
+    nickname = body.get("nickname") or user_id
+    message = body.get("message", "")
     is_direct = body.get("is_direct", True)
     mentioned = body.get("mentioned", False)
     gender = body.get("gender", "")
@@ -1476,7 +1742,7 @@ _webui_ctx = {
 }
 
 _SETTLE_HOUR = 2  # 每天凌晨 2:00 自动结算
-_settle_task: asyncio.Task | None = None
+_settle_task: asyncio.Task[None] | None = None
 
 
 async def _auto_settle_loop() -> None:
@@ -1522,7 +1788,7 @@ app = web.Application()
 app.on_startup.append(_on_startup)
 app.on_cleanup.append(_on_cleanup)
 app.router.add_post("/chat", chat)
-setup_routes(app, _webui_ctx)
+setup_routes(app, cast(dict[str, object], _webui_ctx))
 
 if __name__ == "__main__":
     HOST = None  # None = 双栈（IPv4 + IPv6）

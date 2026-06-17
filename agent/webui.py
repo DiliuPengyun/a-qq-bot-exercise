@@ -3,9 +3,74 @@
 HTML 页面在 templates/ 目录，独立文件，编辑后无需重启。
 """
 import os
+import asyncio
+from collections.abc import Callable, Coroutine
+from typing import TYPE_CHECKING, TypedDict, cast
 from aiohttp import web
 
+if TYPE_CHECKING:
+    from agent.agent import (
+        EmotionData,
+        EmotionUser,
+        EmotionEvent,
+        EmotionEventInput,
+        HistoryMsg,
+        MemSearchItem,
+        Mem0Memory,
+        Mem0LogEntry,
+    )
+
 _TEMPLATES = os.path.join(os.path.dirname(__file__), "templates")
+
+
+# ── 请求体 TypedDict ──
+
+class MemAddBody(TypedDict, total=False):
+    memory: str
+    user_id: str
+    spoken_by: str
+
+
+class MemUpdateBody(TypedDict, total=False):
+    id: str
+    memory: str
+    user_id: str
+    spoken_by: str
+
+
+class MemDeleteBody(TypedDict, total=False):
+    id: str
+
+
+class EmotionUpsertBody(TypedDict, total=False):
+    person_id: str
+    display_name: str
+    summary_before_30d: str
+
+
+class EmotionEventAddBody(TypedDict, total=False):
+    person_id: str
+    display_name: str
+    start_at: str
+    end_at: str
+    dimension: str
+    valence: str
+    impact: int
+    event: str
+
+
+class EmotionEventUpdateBody(TypedDict, total=False):
+    person_id: str
+    index: int
+
+
+class EmotionDeleteBody(TypedDict, total=False):
+    person_id: str
+    index: int
+
+
+class SettleBody(TypedDict, total=False):
+    user_id: str
 
 
 def _page(name: str) -> str:
@@ -14,10 +79,52 @@ def _page(name: str) -> str:
         return f.read()
 
 
+# ── WebUI 上下文类型 ──────────────────────────────────────────
+
+# agent.py 中 _webui_ctx 字典的所有 key 和对应值类型。
+# 用 TypedDict 让 pyright strict 推断出每个 key 的值类型。
+
+
+class WebuiCtx(TypedDict):
+    """setup_routes 的 ctx 参数类型，由 agent.py 注入。"""
+
+    # 文件路径
+    SESSIONS_DIR: str
+    DYNAMIC_PROMPT_FILE: str
+
+    # 异步锁
+    _mem0_lock: asyncio.Lock
+
+    # Mem0 搜索日志
+    _mem0_log: list[Mem0LogEntry]
+
+    # Mem0 同步操作（在锁内调用）
+    _mem_get_all: Callable[..., list[MemSearchItem]]
+    _mem_add: Callable[[str, str, str], Mem0Memory]
+    _mem_update: Callable[..., Mem0Memory]
+    _mem_delete: Callable[[str], None]
+
+    # 情感表操作
+    _emotions_json: Callable[[], EmotionData]
+    _emotion_upsert_user: Callable[[str, str, str], EmotionUser]
+    _emotion_add_event: Callable[[str, str, EmotionEventInput], EmotionEvent]
+    _emotion_update_event: Callable[[str, int, EmotionEventInput], EmotionEvent]
+    _emotion_delete: Callable[[str, int | None], None]
+
+    # 异步结算操作
+    _summarize_and_store: Callable[..., Coroutine[None, None, None]]
+    _update_dynamic_prompt: Callable[..., Coroutine[None, None, None]]
+    _update_emotions: Callable[..., Coroutine[None, None, None]]
+
+    # 历史操作
+    get_history: Callable[[str], list[HistoryMsg]]
+    save_history: Callable[[str, list[HistoryMsg]], None]
+
+
 # ── 路由注册 ────────────────────────────────────────────
 
 
-def setup_routes(app: web.Application, ctx: dict) -> None:
+def setup_routes(app: web.Application, ctx: WebuiCtx) -> None:
     """在 app 上注册所有 WebUI 路由。ctx 由 agent.py 注入。"""
 
     # ── 静态页面（从 templates/ 热读） ──
@@ -60,7 +167,7 @@ def setup_routes(app: web.Application, ctx: dict) -> None:
         return web.json_response(items)
 
     async def memories_add(request: web.Request) -> web.Response:
-        body = await request.json()
+        body = cast(MemAddBody, await request.json())
         memory = (body.get("memory") or "").strip()
         user_id = (body.get("user_id") or "manual").strip()
         spoken_by = (body.get("spoken_by") or "手动添加").strip()
@@ -75,7 +182,7 @@ def setup_routes(app: web.Application, ctx: dict) -> None:
         return web.json_response({"status": "ok", "result": result})
 
     async def memories_update(request: web.Request) -> web.Response:
-        body = await request.json()
+        body = cast(MemUpdateBody, await request.json())
         mid = body.get("id", "")
         memory = (body.get("memory") or "").strip()
         user_id = (body.get("user_id") or "").strip()
@@ -93,7 +200,7 @@ def setup_routes(app: web.Application, ctx: dict) -> None:
         return web.json_response({"status": "ok", "result": result})
 
     async def memories_delete(request: web.Request) -> web.Response:
-        body = await request.json()
+        body = cast(MemDeleteBody, await request.json())
         mid = body.get("id", "")
         if not mid:
             return web.json_response({"status": "error", "reason": "no id"})
@@ -110,7 +217,7 @@ def setup_routes(app: web.Application, ctx: dict) -> None:
         return web.json_response(ctx["_emotions_json"]())
 
     async def emotions_user_upsert(request: web.Request) -> web.Response:
-        body = await request.json()
+        body = cast(EmotionUpsertBody, await request.json())
         person_id = (body.get("person_id") or "").strip()
         display_name = (body.get("display_name") or person_id).strip()
         summary = (body.get("summary_before_30d") or "").strip()
@@ -120,25 +227,25 @@ def setup_routes(app: web.Application, ctx: dict) -> None:
         return web.json_response({"status": "ok", "result": result})
 
     async def emotions_event_add(request: web.Request) -> web.Response:
-        body = await request.json()
+        body = cast(EmotionEventAddBody, await request.json())
         person_id = (body.get("person_id") or "").strip()
         display_name = (body.get("display_name") or person_id).strip()
         if not person_id:
             return web.json_response({"status": "error", "reason": "no person_id"})
-        result = ctx["_emotion_add_event"](person_id, display_name, body)
+        result = ctx["_emotion_add_event"](person_id, display_name, cast(EmotionEventInput, dict(body)))
         return web.json_response({"status": "ok", "result": result})
 
     async def emotions_event_update(request: web.Request) -> web.Response:
-        body = await request.json()
+        body = cast(EmotionEventUpdateBody, await request.json())
         person_id = (body.get("person_id") or "").strip()
         index = int(body.get("index", -1))
         if not person_id:
             return web.json_response({"status": "error", "reason": "no person_id"})
-        result = ctx["_emotion_update_event"](person_id, index, body)
+        result = ctx["_emotion_update_event"](person_id, index, cast(EmotionEventInput, dict(body)))
         return web.json_response({"status": "ok", "result": result})
 
     async def emotions_delete(request: web.Request) -> web.Response:
-        body = await request.json()
+        body = cast(EmotionDeleteBody, await request.json())
         person_id = (body.get("person_id") or "").strip()
         index = body.get("index")
         if not person_id:
@@ -147,7 +254,7 @@ def setup_routes(app: web.Application, ctx: dict) -> None:
         return web.json_response({"status": "ok"})
 
     async def force_settle(request: web.Request) -> web.Response:
-        body = await request.json()
+        body = cast(SettleBody, await request.json())
         user_id = body.get("user_id", "unknown")
         gh = ctx["get_history"]
         history = gh(user_id)
