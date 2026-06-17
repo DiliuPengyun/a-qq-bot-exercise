@@ -381,6 +381,7 @@ gitignore 重点：
 - 心跳主动发言：Bot 在群聊沉默/定时随机搭话
 - 旧 qdrant 错误记忆清理：是否清空/迁移/重采现有错误记忆
 - 更多的 Agent 工具
+- **角色包（远期架构项）**：把现在散布在各模块的角色身份、人格、记忆、情感、工具集打包成可整体切换的角色包（character pack），支持随时切换不同角色，每个角色拥有各自的行为规则、可用工具、记忆库（Mem0 collection 隔离）与情感表。当前架构强假设单一角色——`config.py` 的 `BOT_NAME`/`CREATOR_NAME` 身份常量、`SYSTEM_PROMPT_BASE` 人格、`emotions.json`/`dynamic_prompt.txt`/Mem0 记忆库均与「第六谷绫」绑死。实现前需先设计：角色包的目录结构与清单 schema、按角色路由 /chat（请求体带 character 字段或 bot_qq → 角色映射）、各模块（config/chat/emotions/settlement/memstore/tools）对「当前角色」的参数化改造、WebUI 的角色管理页。这是架构级重构，应在上述系统（mood/known_facts/user_map/emotional_memory 三段式）落地后再启动。
 
 ## 开发约定
 
