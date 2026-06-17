@@ -2,6 +2,8 @@
 第六谷绫 WebUI —— 路由注册 + JSON API handler。
 HTML 页面在 templates/ 目录，独立文件，编辑后无需重启。
 """
+from __future__ import annotations
+
 import os
 import asyncio
 from collections.abc import Callable, Coroutine
@@ -9,14 +11,14 @@ from typing import TYPE_CHECKING, TypedDict, cast
 from aiohttp import web
 
 if TYPE_CHECKING:
-    from agent.agent import (
+    from mem0 import Mem0Memory
+    from models import (
         EmotionData,
         EmotionUser,
         EmotionEvent,
         EmotionEventInput,
         HistoryMsg,
         MemSearchItem,
-        Mem0Memory,
         Mem0LogEntry,
     )
 
@@ -93,28 +95,28 @@ class WebuiCtx(TypedDict):
     DYNAMIC_PROMPT_FILE: str
 
     # 异步锁
-    _mem0_lock: asyncio.Lock
+    mem0_lock: asyncio.Lock
 
     # Mem0 搜索日志
-    _mem0_log: list[Mem0LogEntry]
+    mem0_log: list[Mem0LogEntry]
 
     # Mem0 同步操作（在锁内调用）
-    _mem_get_all: Callable[..., list[MemSearchItem]]
-    _mem_add: Callable[[str, str, str], Mem0Memory]
-    _mem_update: Callable[..., Mem0Memory]
-    _mem_delete: Callable[[str], None]
+    mem_get_all: Callable[..., list[MemSearchItem]]
+    mem_add: Callable[[str, str, str], Mem0Memory]
+    mem_update: Callable[..., Mem0Memory]
+    mem_delete: Callable[[str], None]
 
     # 情感表操作
-    _emotions_json: Callable[[], EmotionData]
-    _emotion_upsert_user: Callable[[str, str, str], EmotionUser]
-    _emotion_add_event: Callable[[str, str, EmotionEventInput], EmotionEvent]
-    _emotion_update_event: Callable[[str, int, EmotionEventInput], EmotionEvent]
-    _emotion_delete: Callable[[str, int | None], None]
+    emotions_json: Callable[[], EmotionData]
+    emotion_upsert_user: Callable[[str, str, str], EmotionUser]
+    emotion_add_event: Callable[[str, str, EmotionEventInput], EmotionEvent]
+    emotion_update_event: Callable[[str, int, EmotionEventInput], EmotionEvent]
+    emotion_delete: Callable[[str, int | None], None]
 
     # 异步结算操作
-    _summarize_and_store: Callable[..., Coroutine[None, None, None]]
-    _update_dynamic_prompt: Callable[..., Coroutine[None, None, None]]
-    _update_emotions: Callable[..., Coroutine[None, None, None]]
+    summarize_and_store: Callable[..., Coroutine[None, None, None]]
+    update_dynamic_prompt: Callable[..., Coroutine[None, None, None]]
+    update_emotions: Callable[..., Coroutine[None, None, None]]
 
     # 历史操作
     get_history: Callable[[str], list[HistoryMsg]]
@@ -156,12 +158,12 @@ def setup_routes(app: web.Application, ctx: WebuiCtx) -> None:
         return web.Response(text="（未生成，下次结算后自动创建）")
 
     async def mem0_log_json(request: web.Request) -> web.Response:
-        return web.json_response(ctx["_mem0_log"])
+        return web.json_response(ctx["mem0_log"])
 
     async def memories_json(request: web.Request) -> web.Response:
         uid = request.query.get("user_id")
-        lock = ctx["_mem0_lock"]
-        get_all = ctx["_mem_get_all"]
+        lock = ctx["mem0_lock"]
+        get_all = ctx["mem_get_all"]
         async with lock:
             items = get_all(user_id=uid)
         return web.json_response(items)
@@ -175,8 +177,8 @@ def setup_routes(app: web.Application, ctx: WebuiCtx) -> None:
             return web.json_response({"status": "error", "reason": "empty memory"})
         if not user_id:
             return web.json_response({"status": "error", "reason": "empty user_id"})
-        lock = ctx["_mem0_lock"]
-        add_fn = ctx["_mem_add"]
+        lock = ctx["mem0_lock"]
+        add_fn = ctx["mem_add"]
         async with lock:
             result = add_fn(memory, user_id, spoken_by)
         return web.json_response({"status": "ok", "result": result})
@@ -193,8 +195,8 @@ def setup_routes(app: web.Application, ctx: WebuiCtx) -> None:
             return web.json_response({"status": "error", "reason": "empty memory"})
         if not user_id:
             return web.json_response({"status": "error", "reason": "empty user_id"})
-        lock = ctx["_mem0_lock"]
-        update_fn = ctx["_mem_update"]
+        lock = ctx["mem0_lock"]
+        update_fn = ctx["mem_update"]
         async with lock:
             result = update_fn(mid, memory, user_id, spoken_by)
         return web.json_response({"status": "ok", "result": result})
@@ -204,8 +206,8 @@ def setup_routes(app: web.Application, ctx: WebuiCtx) -> None:
         mid = body.get("id", "")
         if not mid:
             return web.json_response({"status": "error", "reason": "no id"})
-        lock = ctx["_mem0_lock"]
-        delete_fn = ctx["_mem_delete"]
+        lock = ctx["mem0_lock"]
+        delete_fn = ctx["mem_delete"]
         async with lock:
             delete_fn(mid)
         return web.json_response({"status": "ok"})
@@ -214,7 +216,7 @@ def setup_routes(app: web.Application, ctx: WebuiCtx) -> None:
         return web.Response(text=_page("emotions.html"), content_type="text/html")
 
     async def emotions_json(request: web.Request) -> web.Response:
-        return web.json_response(ctx["_emotions_json"]())
+        return web.json_response(ctx["emotions_json"]())
 
     async def emotions_user_upsert(request: web.Request) -> web.Response:
         body = cast(EmotionUpsertBody, await request.json())
@@ -223,7 +225,7 @@ def setup_routes(app: web.Application, ctx: WebuiCtx) -> None:
         summary = (body.get("summary_before_30d") or "").strip()
         if not person_id:
             return web.json_response({"status": "error", "reason": "no person_id"})
-        result = ctx["_emotion_upsert_user"](person_id, display_name, summary)
+        result = ctx["emotion_upsert_user"](person_id, display_name, summary)
         return web.json_response({"status": "ok", "result": result})
 
     async def emotions_event_add(request: web.Request) -> web.Response:
@@ -232,7 +234,7 @@ def setup_routes(app: web.Application, ctx: WebuiCtx) -> None:
         display_name = (body.get("display_name") or person_id).strip()
         if not person_id:
             return web.json_response({"status": "error", "reason": "no person_id"})
-        result = ctx["_emotion_add_event"](person_id, display_name, cast(EmotionEventInput, dict(body)))
+        result = ctx["emotion_add_event"](person_id, display_name, cast(EmotionEventInput, dict(body)))
         return web.json_response({"status": "ok", "result": result})
 
     async def emotions_event_update(request: web.Request) -> web.Response:
@@ -241,7 +243,7 @@ def setup_routes(app: web.Application, ctx: WebuiCtx) -> None:
         index = int(body.get("index", -1))
         if not person_id:
             return web.json_response({"status": "error", "reason": "no person_id"})
-        result = ctx["_emotion_update_event"](person_id, index, cast(EmotionEventInput, dict(body)))
+        result = ctx["emotion_update_event"](person_id, index, cast(EmotionEventInput, dict(body)))
         return web.json_response({"status": "ok", "result": result})
 
     async def emotions_delete(request: web.Request) -> web.Response:
@@ -250,7 +252,7 @@ def setup_routes(app: web.Application, ctx: WebuiCtx) -> None:
         index = body.get("index")
         if not person_id:
             return web.json_response({"status": "error", "reason": "no person_id"})
-        ctx["_emotion_delete"](person_id, int(index) if index is not None else None)
+        ctx["emotion_delete"](person_id, int(index) if index is not None else None)
         return web.json_response({"status": "ok"})
 
     async def force_settle(request: web.Request) -> web.Response:
@@ -260,8 +262,8 @@ def setup_routes(app: web.Application, ctx: WebuiCtx) -> None:
         history = gh(user_id)
         if not history:
             return web.json_response({"status": "skip", "reason": "无历史"})
-        await ctx["_summarize_and_store"](history, user_id)
-        await ctx["_update_dynamic_prompt"](history)
+        await ctx["summarize_and_store"](history, user_id)
+        await ctx["update_dynamic_prompt"](history)
         history.clear()
         ctx["save_history"](user_id, history)
         return web.json_response({"status": "ok", "cleared": True})

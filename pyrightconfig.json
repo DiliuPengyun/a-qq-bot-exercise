@@ -2,12 +2,23 @@
   "include": [
     "adapter.py",
     "agent/agent.py",
-    "agent/webui.py"
+    "agent/webui.py",
+    "agent/models.py",
+    "agent/config.py",
+    "agent/utils.py",
+    "agent/sessions.py",
+    "agent/memstore.py",
+    "agent/llm.py",
+    "agent/emotions.py",
+    "agent/settlement.py",
+    "agent/tools.py",
+    "agent/chat.py"
   ],
   "venvPath": ".",
   "venv": "venv",
   "typeCheckingMode": "strict",
   "extraPaths": [
-    "stubs"
+    "stubs",
+    "agent"
   ]
 }

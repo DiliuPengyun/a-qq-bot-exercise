@@ -309,10 +309,22 @@ User Prompt (每轮不同)
 ```
 核心文件：
   adapter.py                  NcatBot 事件适配层，监听 QQ 消息并转发给 Agent
-  agent/agent.py              Agent 主入口、DeepSeek 调用、Mem0、结算、HTTP /chat
-  agent/webui.py              WebUI 路由和 JSON API
-  agent/templates/*.html      WebUI 页面模板（首页/控制台/Mem0日志/记忆库）
+  agent/agent.py              Agent 入口：aiohttp app 装配 + /chat handler + WebUI 上下文注入
+  agent/chat.py               核心对话流水线 call_deepseek（检索→矛盾→prompt→DeepSeek→解析→存历史→后台结算）
+  agent/memstore.py           Mem0 客户端单例 + 同步 CRUD + 双门槛检索（海选/选拔）+ 矛盾检测
+  agent/llm.py                DeepSeek 文本调用 + JSON 数组解析/修复（结算专用）
+  agent/emotions.py           emotions.json 读写 + 格式化 + CRUD + 滚动摘要 + 结算更新
+  agent/settlement.py         每日结算编排（摘要存库/日记/情感）+ 后台定时循环
+  agent/sessions.py           会话历史持久化 + 内存缓存
+  agent/tools.py              工具定义 + 调用分发（search_web / should_quote / forget_memory）
+  agent/utils.py              日期时间辅助 + spoken_by / person_id / history_text
+  agent/config.py             env 加载 / 路径 / 模型阈值 / 提示词（含结算 prompt）
+  agent/models.py             全局类型定义（TypedDict 集合）
+  agent/webui.py              WebUI 路由和 JSON API（setup_routes 注入模式）
+  agent/templates/*.html      WebUI 页面模板（首页/控制台/Mem0日志/记忆库/情感表）
   config.example.yaml         脱敏配置模板，可提交
+  pyrightconfig.json          pyright strict 配置（include 全部 .py + extraPaths stubs/agent）
+  stubs/                      mem0 / ncatbot / webui 类型 stub（pyright 解析用）
 
 本地文件（不要提交）：
   config.yaml                 本机 NapCat/NcatBot 配置，含 ws_token、bot_uin、root
@@ -350,18 +362,18 @@ gitignore 重点：
 - **模型输出格式**：`<message>` + `<mood>` XML 标签，ElementTree 解析，`NO_REPLY` 退役
 - **Mem0 检索改为单轮**，结果注入 user prompt，矛盾警告也移到 user prompt
 - **adapter.py 传 bot_qq**
-- **类型纪律**：`agent/agent.py`、`adapter.py`、`agent/webui.py` 全部通过 pyright strict（0 errors），无 `Any`、无 `# type: ignore`；stub 文件（mem0/ncatbot）同步升级为具体 TypedDict
+- **类型纪律**：`agent/` 下全部 .py（agent/chat/memstore/llm/emotions/settlement/sessions/tools/utils/config/models/webui）+ `adapter.py` 全部通过 pyright strict（0 errors），无 `Any`、无 `# type: ignore`；stub 文件（mem0/ncatbot）同步升级为具体 TypedDict
+- **agent.py 单文件拆分（2026-06-17）**：原 1797 行 `agent.py` 拆为 11 个模块（models/config/utils/sessions/memstore/llm/emotions/settlement/tools/chat/agent 入口），行为零变化。跨模块 API 名去掉 `_` 前缀（模块边界取代原单文件 `_` 封装）；`memstore.py`/`webui.py` 加 `from __future__ import annotations` 让 `Mem0Memory`（仅存于 stub）等 TYPE_CHECKING 导入在运行期延迟求值，顺带修掉原单文件 `from mem0 import Mem0Memory` 的运行期 ImportError 隐患
 
 ### 待做
 - **实现 plan.md Part D/B1/E/B3（本版本与下版本之间）**：以下四个系统 plan.md 标为当前版本，但代码尚未落地（或被替代方案覆盖），WebUI 的 `WebuiCtx` 已裁剪到当前实际状态，实现时再加回对应字段：
   - `mood.json`（PAD 三维情绪表，`<mood>` 标签解析，墙钟衰减）——目前被 `emotions.json`（文本情感）部分替代
   - `known_facts.xml`（第一类理性记忆，始终在 system prompt）——目前被 Mem0/Qdrant 替代
-  - `user_map.json`（QQ 号 → 昵称/群名片映射及变更历史）——目前只有无状态 `_person_id()` 字符串拼接
+  - `user_map.json`（QQ 号 → 昵称/群名片映射及变更历史）——目前只有无状态 `person_id()` 字符串拼接
   - `emotional_memory.txt`（三段式日记：最近7天 → 近30天概要 → 更早概要）——目前是 `dynamic_prompt.txt` 单段日记
 - **WebUI 更新**：`webui.py` 和 HTML 模板需要适配新数据结构（emotions v2 affection/trust，以及上述四个系统实现后的 mood.json/known_facts.xml/emotional_memory.txt 三段式）
 - **对话级并发控制**（plan.md Part G）：同一 `user_id` 取消旧生成；已闭合的 `<message>` 直接发送，未闭合部分作为 `<draft>` 打回重算
-- **`_auto_settle_loop` 的 bot_qq**：自动结算扫描时缺少 bot_qq 参数，暂时传入空字符串；需评估是否从 config 获取
-- 修正 `agent.py` 顶部注释/旧文档里的端口和返回格式
+- **`auto_settle_loop` 的 bot_qq**：自动结算扫描时缺少 bot_qq 参数，暂时传入空字符串；需评估是否从 config 获取
 - 评估 `check_and_settle` 的时机：跨过 2:00 的第一条消息也会被纳入上一日结算并清空历史
 - `should_quote` 改造：让模型能指定引用具体消息
 - `send_sticker` 工具：枚举 QQ 表情包，模型传枚举值发小黄脸
@@ -371,7 +383,7 @@ gitignore 重点：
 
 ## 开发约定
 
-- 修改 `agent/agent.py` 或 `agent/webui.py` 后重启 `python agent/agent.py`
+- 修改 `agent/` 下任何 `.py`（含 agent/chat/memstore/llm/emotions/settlement/sessions/tools/utils/config/models/webui）后重启 `python agent/agent.py`
 - 只改 `agent/templates/*.html` 不用重启 Agent，模板每次请求热读
 - 修改 `adapter.py` 后重启 `python adapter.py`
 - NapCat 不用重启
