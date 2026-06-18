@@ -12,7 +12,7 @@ from typing import TypedDict, cast
 import httpx
 from ncatbot.app.client import BotClient
 from ncatbot.core.registry import registrar
-from ncatbot.types.qq import MessageEvent, MessageType
+from ncatbot.types.qq import MessageEventData, MessageType
 from ncatbot.types.common.segment import At
 from ncatbot.utils import get_config_manager
 
@@ -48,7 +48,7 @@ cfg = get_config_manager()
 bot = BotClient()
 
 
-async def get_group_info(event: MessageEvent) -> GroupInfo:
+async def get_group_info(event: MessageEventData) -> GroupInfo:
     """获取群基本信息（每次实时查询，群主和管理员可能变更）"""
     group_id = str(event.group_id)
     try:
@@ -69,7 +69,7 @@ async def get_group_info(event: MessageEvent) -> GroupInfo:
         return {"member_count": 0, "owner_name": "", "admin_names": []}
 
 
-async def resolve_at_mentions(event: MessageEvent) -> str:
+async def resolve_at_mentions(event: MessageEventData) -> str:
     """把 raw_message 中的 [CQ:at,qq=xxx] 替换成 @昵称"""
     raw = event.raw_message or ""
     group_id = getattr(event, "group_id", None) if hasattr(event, "message_type") and event.message_type == MessageType.GROUP else None
@@ -97,7 +97,7 @@ async def resolve_at_mentions(event: MessageEvent) -> str:
     return re.sub(r"\[CQ:at,qq=(\d+)\]", repl, raw)
 
 
-def has_at_mention(event: MessageEvent) -> bool:
+def has_at_mention(event: MessageEventData) -> bool:
     """检测是否 @ 了 Bot（仅告知模型，不强制回复）"""
     bot_qq = str(cfg.bot_uin)
     if event.message:
@@ -146,7 +146,7 @@ async def call_agent(
 
 
 @registrar.on("message")
-async def handle_message(event: MessageEvent) -> None:
+async def handle_message(event: MessageEventData) -> None:
     is_group = event.message_type == MessageType.GROUP
     # 群聊：群名片(QQ昵称)；私聊：QQ昵称
     # 半角 () 包裹 QQ 昵称，名字内的半角括号用 \ 转义

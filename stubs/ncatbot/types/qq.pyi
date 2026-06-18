@@ -25,7 +25,7 @@ class BotApi:
     async def post_private_msg(self, *, user_id: str, text: str) -> None: ...
 
 
-class MessageEvent:
+class MessageEventData:
     group_id: str
     user_id: str
     raw_message: str
