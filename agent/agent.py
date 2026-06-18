@@ -29,6 +29,7 @@
 """
 
 import asyncio
+import json
 import traceback
 from typing import cast
 
@@ -67,7 +68,7 @@ from webui import setup_routes
 # ── HTTP 接口 ────────────────────────────────────────────
 
 
-async def chat(request: web.Request) -> web.Response:
+async def chat(request: web.Request) -> web.StreamResponse:
     body = cast(ChatRequestBody, await request.json())
     user_id = body.get("user_id", "")
     nickname = body.get("nickname") or user_id
@@ -96,18 +97,34 @@ async def chat(request: web.Request) -> web.Response:
     ctx = GenerationContext()
     register(user_id, ctx)
 
+    # SSE 响应：每轮 message 作为 event 推送，adapter 收到就发 QQ
+    resp = web.StreamResponse(
+        status=200,
+        headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
+    await resp.prepare(request)
+
+    async def on_reply(msg: str, quote: bool) -> None:
+        data = json.dumps({"reply": msg, "quote": quote}, ensure_ascii=False)
+        await resp.write(f"data: {data}\n\n".encode("utf-8"))
+
     # 创建生成任务
     task = asyncio.create_task(call_deepseek(
         user_id, nickname, message, is_direct, group_info, mentioned, gender,
         sender_id, message_time, qq_name, group_card, bot_qq,
-        draft=draft, ctx=ctx,
+        draft=draft, ctx=ctx, on_reply=on_reply,
     ))
     ctx.task = task
 
     try:
-        replies = await task
+        await task
+        await resp.write(b"data: {\"done\": true}\n\n")
     except asyncio.CancelledError:
-        # 任务被新请求取消：返回已闭合的 <message>（已发送给用户）
+        # 任务被新请求取消：已推送的 message 已通过 SSE 发出
         # 如果 task 仍未完成（handler 被 aiohttp 取消），先清理 task
         if not task.done():
             task.cancel()
@@ -115,18 +132,16 @@ async def chat(request: web.Request) -> web.Response:
                 await task
             except asyncio.CancelledError:
                 pass
+            await resp.write_eof()
             raise  # aiohttp 取消，向上传播
-        partial = [(m, ctx.quote) for m in ctx.complete_messages]
-        return web.json_response({
-            "replies": [{"reply": r, "quote": q} for r, q in partial]
-        })
+        await resp.write(b"data: {\"cancelled\": true}\n\n")
     except Exception as e:
         traceback.print_exc()
-        return web.json_response({"replies": [{"reply": f"出错了：{e}", "quote": False}]})
-
-    return web.json_response({
-        "replies": [{"reply": r, "quote": q} for r, q in replies]
-    })
+        err = json.dumps({"error": f"出错了：{e}"}, ensure_ascii=False)
+        await resp.write(f"data: {err}\n\n".encode("utf-8"))
+    finally:
+        await resp.write_eof()
+    return resp
 
 
 # ── WebUI 上下文 ─────────────────────────────────────────

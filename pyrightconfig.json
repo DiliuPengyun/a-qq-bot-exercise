@@ -16,7 +16,8 @@
     "agent/concurrency.py",
     "agent/settlement.py",
     "agent/tools.py",
-    "agent/chat.py"
+    "agent/chat.py",
+    "agent/parsing.py"
   ],
   "venvPath": ".",
   "venv": "venv",

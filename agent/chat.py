@@ -1,14 +1,13 @@
 """核心对话流水线：call_deepseek。
 
-检索 → 矛盾检测 → 拼 prompt → 调 DeepSeek(流式,含工具) → 解析回复 → 保存历史 → 后台结算。
-支持对话级并发控制：取消旧任务时提取已闭合 <message> 直接发送，未闭合尾部作为 <draft> 打回。
+检索 → 矛盾检测 → 拼 prompt → 调 DeepSeek(流式,含工具) → 逐轮解析推送 → 保存历史 → 后台结算。
+每轮工具调用后立即通过 on_reply 回调推送已闭合 <message>，未闭合尾部作为 draft 传下一轮续写。
 """
 
 import asyncio
 import json
 import os
-import re
-import xml.etree.ElementTree as ET
+from collections.abc import Awaitable, Callable
 from typing import cast
 
 import httpx
@@ -16,26 +15,34 @@ import httpx
 from concurrency import GenerationContext
 from config import (
     BOT_NAME,
+    CHAT_REPAIR_PROMPT,
     DEEPSEEK_KEY,
     DEEPSEEK_URL,
     DYNAMIC_PROMPT_FILE,
     EMOTIONAL_MEMORY_FILE,
+    MAX_TOOL_TURNS,
     MODEL,
+    MOOD_REPAIR_PROMPT,
     SYSTEM_PROMPT_BASE,
 )
 from emotions import format_emotions_for_prompt
 from knownfacts import inject_known_facts
+from llm import repair_until_valid
 from memstore import detect_conflicts, format_memories, search_memories
 from models import (
     DeepSeekMessage,
     GroupInfo,
     MemSearchItem,
-    ModelOutput,
     ParsedMood,
     ToolCall,
     ToolDef,
 )
 from mood import format_mood_for_prompt, update_mood
+from parsing import (
+    extract_complete_and_draft,
+    parse_for_repair,
+    parse_mood,
+)
 from sessions import get_history, save_history
 from settlement import safe_settle
 from tools import TOOLS, handle_tool_calls
@@ -57,53 +64,6 @@ def _load_emotional_memory() -> str:
     return ""
 
 
-def _escape_stray_ampersands(text: str) -> str:
-    """转义游离的 &，避免 XML 解析失败。"""
-    return re.sub(
-        r"&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#x[0-9a-fA-F]+;)",
-        "&amp;",
-        text,
-    )
-
-
-def _parse_model_output(output: str) -> ModelOutput:
-    """解析模型输出，提取 <message> 和 <mood> 标签。
-
-    返回 {"messages": [...], "mood": ParsedMood | None}
-    """
-    escaped = _escape_stray_ampersands(output)
-    try:
-        root = ET.fromstring(f"<root>{escaped}</root>")
-    except ET.ParseError as e:
-        print(f"[Parse] XML 解析失败: {e}")
-        return {"messages": [], "mood": None}
-
-    # 提取 <message> 标签
-    messages: list[str] = []
-    for msg_elem in root.findall("message"):
-        text = "".join(msg_elem.itertext()).strip()
-        if text:
-            messages.append(text)
-
-    # 提取 <mood> 标签
-    mood: ParsedMood | None = None
-    mood_elem = root.find("mood")
-    if mood_elem is not None:
-        try:
-            mood = {
-                "p": float(mood_elem.get("p", 0)),
-                "a": float(mood_elem.get("a", 0)),
-                "d": float(mood_elem.get("d", 0)),
-                "reason": mood_elem.get("reason", ""),
-                "label": (mood_elem.text or "").strip(),
-            }
-        except (ValueError, TypeError) as e:
-            print(f"[Parse] mood 标签解析失败: {e}")
-            mood = None
-
-    return {"messages": messages, "mood": mood}
-
-
 def _build_sender_tag(
     nickname: str, gender: str, pid: str,
     qq_name: str, group_card: str, ts: str, content: str,
@@ -121,42 +81,6 @@ def _build_sender_tag(
     return f"<sender {attrs}>{content}</sender>"
 
 
-# ── 流式增量扫描 ────────────────────────────────────────
-
-
-_MESSAGE_OPEN_RE = re.compile(r"<message\s*>")
-
-
-def _extract_complete_and_draft(buffer: str) -> tuple[list[str], str]:
-    """从 buffer 中提取已闭合的 <message> 内容和未闭合的草稿。
-
-    Returns:
-        (complete_messages, draft)
-        - complete_messages: 已闭合 <message> 标签的文本内容列表
-        - draft: 最后一个未闭合 <message> 标签内的文本（不含标签本身）
-    """
-    messages: list[str] = []
-    draft = ""
-    pos = 0
-
-    while True:
-        m = _MESSAGE_OPEN_RE.search(buffer, pos)
-        if m is None:
-            break
-        start = m.end()
-        end = buffer.find("</message>", start)
-        if end == -1:
-            # 未闭合的 <message>，提取内容作为草稿
-            draft = buffer[start:].strip()
-            break
-        content = buffer[start:end].strip()
-        if content:
-            messages.append(content)
-        pos = end + len("</message>")
-
-    return messages, draft
-
-
 # ── 工具调用增量累积 ────────────────────────────────────
 
 
@@ -171,7 +95,7 @@ class _ToolCallAccumulator:
             idx_val = delta.get("index", 0)
             idx = int(idx_val) if isinstance(idx_val, (int, float)) else 0
             if idx not in self._calls:
-                self._calls[idx] = {"id": "", "function": {"name": "", "arguments": ""}}
+                self._calls[idx] = {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
             call = self._calls[idx]
             id_val = delta.get("id")
             if isinstance(id_val, str) and id_val:
@@ -187,7 +111,12 @@ class _ToolCallAccumulator:
                     call["function"]["arguments"] += args
 
     def get_tool_calls(self) -> list[ToolCall]:
-        return [self._calls[idx] for idx in sorted(self._calls)]
+        calls = [self._calls[idx] for idx in sorted(self._calls)]
+        # 确保每个 tool_call 有非空 id（流式响应偶尔缺失时兜底）
+        for i, c in enumerate(calls):
+            if not c["id"]:
+                c["id"] = f"call_{i}"
+        return calls
 
     def has_calls(self) -> bool:
         return any(c["function"]["name"] for c in self._calls.values())
@@ -216,7 +145,10 @@ async def _stream_response(
     tool_acc = _ToolCallAccumulator()
 
     async with client.stream("POST", DEEPSEEK_URL, headers=headers, json=payload) as resp:
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            body = await resp.aread()
+            print(f"[DeepSeek] HTTP {resp.status_code}: {body.decode('utf-8', errors='replace')[:2000]}")
+            resp.raise_for_status()
         async for line in resp.aiter_lines():
             if not line.startswith("data: "):
                 continue
@@ -248,8 +180,9 @@ async def _stream_response(
             if isinstance(content_delta, str) and content_delta:
                 content_buffer += content_delta
                 if ctx is not None:
-                    complete, draft = _extract_complete_and_draft(content_buffer)
-                    ctx.complete_messages = complete
+                    # 流式期间只更新 draft（取消路径需要它传下一轮）；
+                    # 已闭合 message 的推送由 call_deepseek 每轮结束后处理
+                    _, draft = extract_complete_and_draft(content_buffer)
                     ctx.draft = draft
 
             # Tool call deltas
@@ -272,7 +205,8 @@ async def call_deepseek(
     qq_name: str = "", group_card: str = "",
     bot_qq: str = "",
     draft: str = "", ctx: GenerationContext | None = None,
-) -> list[tuple[str, bool]]:
+    on_reply: Callable[[str, bool], Awaitable[None]] | None = None,
+) -> None:
     # 0. 更新用户映射表
     if sender_id:
         await update_user_map(user_id, sender_id, qq_name, group_card)
@@ -371,57 +305,121 @@ async def call_deepseek(
 
     headers = {"Authorization": f"Bearer {DEEPSEEK_KEY}"}
 
-    # 7. 流式调用 DeepSeek
-    #    CancelledError 可在任意 await 点抛出；ctx 已有最新 complete_messages / draft
-    #    取消时不保存历史、不结算——由调用方（agent.py）读取 ctx 返回部分结果
+    # 7. 流式调用 DeepSeek（工具调用多轮循环）
+    #    每轮结束后立即解析 mood/message 并通过 on_reply 推送，未闭合尾部留 draft 续写。
+    #    CancelledError 可在任意 await 点抛出；ctx.draft 有最新未闭合内容供取消路径读取。
+    #    取消时不保存历史、不结算——由调用方（agent.py）关闭 SSE 流。
     content_buffer = ""
     quote = False
+    # 已推送的 message 数量（跨轮累加 buffer，防止重复推送）
+    prev_complete_count = 0
+    # mood 已扫描到的 buffer 位置（跨轮累加 buffer，防止重复匹配旧 mood）
+    mood_offset = 0
+    # 下一轮是否向模型提供工具：额度耗尽后置 None，迫使模型用已有结果产出正文
+    tools_for_next: list[ToolDef] | None = TOOLS
+
+    # 记录最后一轮的解析结果，供循环后的 repair 使用
+    last_parsed_mood: ParsedMood | None = None
+    last_draft = ""
 
     async with httpx.AsyncClient(timeout=120) as client:
-        # 第一轮（流式，带工具）
-        content_buffer, tool_calls = await _stream_response(
-            client, headers, messages, TOOLS, content_buffer, ctx
-        )
+        turn = 0
+        while True:
+            content_buffer, tool_calls = await _stream_response(
+                client, headers, messages, tools_for_next, content_buffer, ctx
+            )
 
-        if tool_calls:
-            # 构造 assistant 消息用于工具调用第二轮
+            # 每轮后处理：解析 mood + message，立即推送新增的 message
+            # mood：只看新增部分（mood_offset 之后），避免重复匹配旧 mood
+            new_mood = parse_mood(content_buffer[mood_offset:])
+            if new_mood:
+                update_mood(new_mood)
+                # 推进 offset 到最后一个 </mood> 之后
+                mood_end = content_buffer.rfind("</mood>", mood_offset)
+                if mood_end >= 0:
+                    mood_offset = mood_end + len("</mood>")
+
+            complete_messages, last_draft = extract_complete_and_draft(content_buffer)
+            # 只推送新增的 message（之前轮次已推送过的跳过）
+            new_messages = complete_messages[prev_complete_count:]
+            prev_complete_count = len(complete_messages)
+            if new_messages and on_reply is not None:
+                for msg in new_messages:
+                    await on_reply(msg, quote)
+
+            last_parsed_mood = new_mood
+
+            if not tool_calls:
+                # 模型已产出正文，不再调用工具
+                if ctx is not None:
+                    ctx.quote = quote
+                break
+
+            # 额度耗尽仍有 tool_calls（理论上 tools=None 时不会发生）→ 不再执行，直接结束
+            if turn >= MAX_TOOL_TURNS:
+                if ctx is not None:
+                    ctx.quote = quote
+                break
+
+            # 构造 assistant 消息用于下一轮
+            # content 为空时不传该字段（DeepSeek 要求 content 为 null 而非 ""）
+            # content 带本轮输出（含未闭合 draft），模型下一轮能看到自己说过什么，自行决定续写或重写
             assistant_msg: DeepSeekMessage = {
                 "role": "assistant",
-                "content": content_buffer,
                 "tool_calls": tool_calls,
             }
-            quote, tool_responses = await handle_tool_calls(assistant_msg)
+            if content_buffer:
+                assistant_msg["content"] = content_buffer
+            turn_quote, tool_responses = await handle_tool_calls(assistant_msg)
+            quote = quote or turn_quote
             if ctx is not None:
                 ctx.quote = quote
 
-            if tool_responses:
-                messages.append(cast(dict[str, object], assistant_msg))
-                messages.extend(cast(list[dict[str, object]], tool_responses))
-                # 第二轮（流式，不带工具）
-                content_buffer, _ = await _stream_response(
-                    client, headers, messages, None, content_buffer, ctx
-                )
-        else:
-            if ctx is not None:
-                ctx.quote = False
+            messages.append(cast(dict[str, object], assistant_msg))
+            messages.extend(cast(list[dict[str, object]], tool_responses))
 
-    # ── 以下为正常完成后的后处理（取消时不会执行） ──
+            turn += 1
+            # 额度耗尽：下一轮不再提供工具，让模型把已有结果汇总成 <message>
+            tools_for_next = TOOLS if turn < MAX_TOOL_TURNS else None
 
-    # 8. 解析 mood（从完整 content_buffer）
-    parsed = _parse_model_output(content_buffer)
-    parsed_mood = parsed.get("mood")
-    if parsed_mood:
-        update_mood(parsed_mood)
+    # ── 以下为最后一轮的后处理（取消时不会执行）──
+    #    repair 只在最后一轮触发：中间轮模型可能只输出 tool_call 不输出 message，属正常。
 
-    # 9. 构建最终回复
+    # repair 策略：
+    #   - message 完全缺失（无已闭合也无 draft）→ CHAT_REPAIR 一次修 mood+message
+    #   - message 有效但 mood 无效 → 单独 MOOD_REPAIR 只修 mood
+    final_messages = complete_messages
+    if not final_messages and not last_draft:
+        print("[Chat] 无回复内容，尝试修复...")
+        repaired = await repair_until_valid(
+            parse_for_repair, CHAT_REPAIR_PROMPT,
+            content_buffer, "ChatParse", max_retries=2,
+        )
+        if repaired is not None:
+            final_messages = repaired.get("messages", [])
+            last_draft = ""  # repair 产出的视为完整闭合，无 draft
+            # 推送 repair 出的 message
+            if final_messages and on_reply is not None:
+                for msg in final_messages:
+                    await on_reply(msg, quote)
+            # CHAT_REPAIR 同时修了 mood，优先取它（避免覆盖原本有效的 mood）
+            if last_parsed_mood is None:
+                last_parsed_mood = repaired.get("mood")
+    elif last_parsed_mood is None:
+        print("[Chat] mood 缺失或无效，尝试修复...")
+        last_parsed_mood = await repair_until_valid(
+            parse_mood, MOOD_REPAIR_PROMPT,
+            content_buffer, "MoodParse", max_retries=2,
+        )
+        # repair 出的 mood 也要更新
+        if last_parsed_mood:
+            update_mood(last_parsed_mood)
+
+    # 未闭合的 draft 留在 ctx，下一轮 acquire 读走续写
     if ctx is not None:
-        all_messages = ctx.complete_messages
-    else:
-        all_messages = parsed.get("messages", [])
+        ctx.draft = last_draft
 
-    final_replies: list[tuple[str, bool]] = [(msg, quote) for msg in all_messages]
-
-    # 10. 保存对话历史
+    # 8. 保存对话历史
     history.append({
         "role": "user",
         "content": user_msg,
@@ -436,14 +434,12 @@ async def call_deepseek(
     bot_ts = now_minute()
     bot_pid = person_id(user_id, bot_qq) if bot_qq else "bot"
     bot_display = BOT_NAME
-    for rep, _ in final_replies:
+    for rep in final_messages:
         bot_tag = _build_sender_tag(
             bot_display, "female", bot_pid, BOT_NAME, BOT_NAME, bot_ts, rep
         )
         history.append({"role": "assistant", "content": bot_tag, "ts": bot_ts})
     save_history(user_id, history)
 
-    # 11. 每日结算记忆（后台执行，不阻塞回复）
+    # 9. 每日结算记忆（后台执行，不阻塞回复）
     asyncio.create_task(safe_settle(user_id, history, bot_qq))
-
-    return final_replies

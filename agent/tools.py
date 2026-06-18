@@ -104,7 +104,17 @@ async def handle_tool_calls(msg: DeepSeekMessage) -> tuple[bool, list[ToolRespon
     for tc in msg.get("tool_calls", []):
         name = tc["function"]["name"]
         args_raw = tc["function"].get("arguments", "{}")
-        args_parsed: object = json.loads(args_raw)
+        try:
+            args_parsed: object = json.loads(args_raw)
+        except json.JSONDecodeError as e:
+            # 模型输出的 arguments 不是合法 JSON（流式拼接切在非法位置等），
+            # 不抛异常——把错误回传给模型，让它在下一轮用合法 JSON 重新调用。
+            responses.append({
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "content": f"arguments 不是合法 JSON：{e}。请用合法 JSON 重新调用该工具。",
+            })
+            continue
         args = cast(dict[str, object], args_parsed) if isinstance(args_parsed, dict) else {}
 
         if name == "should_quote":

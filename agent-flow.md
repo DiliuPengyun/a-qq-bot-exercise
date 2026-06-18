@@ -2,7 +2,7 @@
 
 ```mermaid
 flowchart TD
-    START["POST /chat<br/>{user_id, message, sender_tag, is_direct, mentioned, group_info}"] --> SETTLE
+    START["POST /chat (SSE)<br/>{user_id, message, sender_tag, is_direct, mentioned, group_info}"] --> SETTLE
 
     subgraph SETTLE["📅 每日结算（2:00 AM 分界）"]
         SL1{"上次结算 &lt; 边界？"}
@@ -37,39 +37,40 @@ flowchart TD
         B2["user prompt 前置：<br/>当前 mood + user_map"] --> B5
         B3["user prompt 追加：<br/>memories + conflicts"] --> B5
         B4["当前消息 &lt;sender ...&gt;"] --> B5
-        B5["工具：should_quote / forget_memory / search_web"] --> DS
+        B5["工具：should_quote / forget_memory / search_web"] --> LOOP
     end
 
-    subgraph DS["🧠 DeepSeek V4 Flash"]
-        D1{"模型调工具？"}
-        D1 -- 否 --> D2["输出 &lt;message&gt; + &lt;mood&gt;"]
-        D1 -- should_quote --> D3["引用"]
-        D1 -- forget_memory --> D5["删记忆"]
-        D1 -- search_web --> D6["Firecrawl 搜索"]
-        D2 --> D4["原始模型输出"]
-        D3 --> D4
-        D5 --> D4
-        D6 --> D4
+    subgraph LOOP["🔄 工具调用多轮循环（每轮独立处理）"]
+        L1["DeepSeek SSE 流式<br/>逐 chunk 累积 content_buffer"] --> L2["每轮结束：解析 mood + message"]
+        L2 --> L3{"有 &lt;message&gt;？"}
+        L3 -- 是 --> L4["SSE 推送 reply event<br/>→ adapter 立即发 QQ"]
+        L3 -- 否 --> L5
+        L4 --> L5{"模型还调工具？"}
+        L5 -- 是 --> L6["执行工具<br/>assistant_msg 带 content（含未闭合 draft）<br/>模型下轮自行续写或重写"]
+        L6 --> L1
+        L5 -- 否 --> LDONE["循环结束"]
     end
 
-    D4 --> PARSE["解析 XML 输出"]
+    LDONE --> REPAIR
 
-    subgraph PARSE["📄 输出解析"]
-        P1["提取 &lt;message&gt; 标签"] --> P2["提取 &lt;mood&gt; 标签"]
-        P2 --> P3["无 &lt;message&gt; → 静默"]
+    subgraph REPAIR["📄 最后一轮 repair（仅失败时触发）"]
+        R1{"有 &lt;message&gt; 或 draft？"}
+        R1 -- 都没有 --> R2["CHAT_REPAIR<br/>一次修 mood+message<br/>修出的 message 推送"]
+        R1 -- 有 --> R3{"mood 有效？"}
+        R3 -- 无 --> R4["MOOD_REPAIR<br/>单独修 mood"]
+        R3 -- 有 --> R5["跳过"]
     end
 
-    P2 --> MOOD["保存 mood.json"]
-    P1 --> HISTORY["💾 写入历史<br/>&lt;sender display=... ts=...&gt; message"]
+    R2 --> FINAL
+    R4 --> FINAL
+    R5 --> FINAL
 
-    HISTORY --> SEND
-
-    subgraph SEND["📤 Adapter 发送"]
-        AD1{"reply 是否为空？"}
-        AD1 -- 是 --> AD2["不发消息"]
-        AD1 -- 否 + 多条 --> AD3["逐条发送"]
+    subgraph FINAL["💾 收尾"]
+        F1["未闭合 draft 留 ctx<br/>下轮 acquire 读走"]
+        F2["保存历史<br/>user + bot 均 &lt;sender&gt; 标签"]
+        F3["后台 safe_settle（不阻塞）"]
+        F1 --> F2 --> F3
     end
 
-    AD3 --> END1["用户收到回复"]
-    AD2 --> END2["静默"]
+    F3 --> SSE_DONE["SSE 推送 done event<br/>adapter 结束读取"]
 ```

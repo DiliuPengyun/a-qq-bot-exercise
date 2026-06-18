@@ -158,6 +158,7 @@ class ToolCallFunction(TypedDict):
 
 class ToolCall(TypedDict):
     id: str
+    type: str
     function: ToolCallFunction
 
 

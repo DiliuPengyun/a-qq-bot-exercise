@@ -6,6 +6,7 @@
 """
 
 import re
+import json
 import asyncio
 from datetime import datetime
 from typing import TypedDict, cast
@@ -41,7 +42,7 @@ class ChatRequestBody(TypedDict, total=False):
 
 
 AGENT_URL = "http://127.0.0.1:8081/chat"
-AGENT_TIMEOUT = 30
+AGENT_TIMEOUT = 120  # SSE 流式响应，需覆盖工具调用多轮 + DeepSeek 流式时间
 
 cfg = get_config_manager()
 
@@ -107,12 +108,23 @@ def has_at_mention(event: MessageEventData) -> bool:
     return False
 
 
+async def _send(event: MessageEventData, reply: str, quote: bool, is_group: bool) -> None:
+    """发送一条消息到 QQ"""
+    if quote:
+        await event.reply(text=reply)
+    elif is_group:
+        await event.api.post_group_msg(group_id=event.group_id, text=reply)
+    else:
+        await event.api.post_private_msg(user_id=event.user_id, text=reply)
+
+
 async def call_agent(
+    event: MessageEventData, is_group: bool,
     user_id: str, nickname: str, message: str, is_direct: bool, group_info: GroupInfo | None = None,
     mentioned: bool = False, gender: str = "", sender_id: str = "", message_time: str = "",
     qq_name: str = "", group_card: str = "",
-) -> list[tuple[str, bool]]:
-    """调用 Agent，返回 [(reply, quote), ...]"""
+) -> None:
+    """调用 Agent（SSE 流式），逐条收到 reply 就发 QQ"""
     body: ChatRequestBody = {
         "user_id": user_id,
         "nickname": nickname,
@@ -135,14 +147,26 @@ async def call_agent(
     if group_card:
         body["group_card"] = group_card
     async with httpx.AsyncClient(timeout=AGENT_TIMEOUT) as client:
-        resp = await client.post(AGENT_URL, json=body)
-        resp.raise_for_status()
-        data = cast(dict[str, object], resp.json())
-        replies_raw = data.get("replies", [])
-        replies = cast(list[dict[str, object]], replies_raw) if isinstance(replies_raw, list) else []
-        if replies:
-            return [(str(r.get("reply", "")), bool(r.get("quote", False))) for r in replies if r.get("reply")]
-        return []
+        async with client.stream("POST", AGENT_URL, json=body) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                try:
+                    data = cast(dict[str, object], json.loads(data_str))
+                except json.JSONDecodeError:
+                    continue
+                if data.get("done") or data.get("cancelled"):
+                    break
+                if data.get("error"):
+                    await _send(event, str(data["error"]), False, is_group)
+                    break
+                reply = str(data.get("reply", ""))
+                quote = bool(data.get("quote", False))
+                if reply:
+                    await _send(event, reply, quote, is_group)
+                    await asyncio.sleep(0.6)  # 多条消息间隔一小段时间
 
 
 @registrar.on("message")
@@ -177,9 +201,18 @@ async def handle_message(event: MessageEventData) -> None:
     mentioned = is_group and has_at_mention(event)
 
     # 解析 @ 为昵称
-    resolved_msg = await resolve_at_mentions(event) if is_group else event.raw_message
-    # 获取群信息
-    group_info = await get_group_info(event) if is_group else None
+    print(f"[Adapter] 收到消息: {event.raw_message[:50]}")
+    try:
+        resolved_msg = await resolve_at_mentions(event) if is_group else event.raw_message
+        print(f"[Adapter] @解析完成: {resolved_msg[:50]}")
+        # 获取群信息
+        group_info = await get_group_info(event) if is_group else None
+        print(f"[Adapter] 群信息获取完成: {group_info.get('member_count', 0) if group_info else 0}人")
+    except Exception as e:
+        print(f"[Adapter] 预处理异常: {e}")
+        import traceback; traceback.print_exc()
+        resolved_msg = event.raw_message
+        group_info = None
     sender_id = str(event.user_id)
     raw_time = event.time
     if raw_time:
@@ -191,21 +224,13 @@ async def handle_message(event: MessageEventData) -> None:
         message_time = ""
 
     try:
-        replies = await call_agent(user_id, nickname, resolved_msg, is_direct, group_info, mentioned, gender, sender_id, message_time, qq_name, card)
+        print(f"[Adapter] 调用 Agent: user_id={user_id}, msg={resolved_msg[:30]}")
+        await call_agent(event, is_group, user_id, nickname, resolved_msg, is_direct, group_info, mentioned, gender, sender_id, message_time, qq_name, card)
+        print(f"[Adapter] Agent 流式调用完成")
     except Exception as e:
-        replies = [(f"出错了：{e}", False)]
-
-    for reply, quote in replies:
-        if not reply:
-            continue
-        if quote:
-            await event.reply(text=reply)
-        elif is_group:
-            await event.api.post_group_msg(group_id=event.group_id, text=reply)
-        else:
-            await event.api.post_private_msg(user_id=event.user_id, text=reply)
-        # 多条消息间隔一小段时间
-        await asyncio.sleep(0.6)
+        print(f"[Adapter] Agent 调用异常: {e}")
+        import traceback; traceback.print_exc()
+        await _send(event, f"出错了：{e}", False, is_group)
 
 
 if __name__ == "__main__":
