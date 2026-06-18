@@ -92,7 +92,7 @@ class WebuiCtx(TypedDict):
 
     # 文件路径
     SESSIONS_DIR: str
-    DYNAMIC_PROMPT_FILE: str
+    EMOTIONAL_MEMORY_FILE: str
 
     # 异步锁
     mem0_lock: asyncio.Lock
@@ -115,7 +115,7 @@ class WebuiCtx(TypedDict):
 
     # 异步结算操作
     summarize_and_store: Callable[..., Coroutine[None, None, None]]
-    update_dynamic_prompt: Callable[..., Coroutine[None, None, None]]
+    update_emotional_memory: Callable[..., Coroutine[None, None, None]]
     update_emotions: Callable[..., Coroutine[None, None, None]]
 
     # 历史操作
@@ -151,7 +151,7 @@ def setup_routes(app: web.Application, ctx: WebuiCtx) -> None:
         return web.json_response({"sessions": files})
 
     async def view_dynamic_prompt(request: web.Request) -> web.Response:
-        df = ctx["DYNAMIC_PROMPT_FILE"]
+        df = ctx["EMOTIONAL_MEMORY_FILE"]
         if os.path.exists(df):
             with open(df, encoding="utf-8") as f:
                 return web.Response(text=f.read())
@@ -263,7 +263,7 @@ def setup_routes(app: web.Application, ctx: WebuiCtx) -> None:
         if not history:
             return web.json_response({"status": "skip", "reason": "无历史"})
         await ctx["summarize_and_store"](history, user_id)
-        await ctx["update_dynamic_prompt"](history)
+        await ctx["update_emotional_memory"](history)
         history.clear()
         ctx["save_history"](user_id, history)
         return web.json_response({"status": "ok", "cleared": True})

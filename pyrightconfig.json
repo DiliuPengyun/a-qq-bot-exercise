@@ -10,6 +10,10 @@
     "agent/memstore.py",
     "agent/llm.py",
     "agent/emotions.py",
+    "agent/mood.py",
+    "agent/usermap.py",
+    "agent/knownfacts.py",
+    "agent/concurrency.py",
     "agent/settlement.py",
     "agent/tools.py",
     "agent/chat.py"

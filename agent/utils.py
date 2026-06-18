@@ -1,6 +1,7 @@
 """通用工具：日期时间辅助 + 文本/spoken_by/person_id 处理。"""
 
 import ast
+import re
 from datetime import datetime, timedelta
 from typing import cast
 
@@ -22,6 +23,10 @@ def settlement_boundary() -> datetime:
 
 def now_minute() -> str:
     return datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
+
+
+def now_iso() -> str:
+    return datetime.now(LOCAL_TZ).isoformat()
 
 
 def parse_dt(text: str | None) -> datetime | None:
@@ -79,20 +84,56 @@ def format_spoken_by(spoken_by: str | list[str] | tuple[str, ...] | None) -> str
     return "、".join(sources) if sources else "未知"
 
 
-def person_id(session_id: str, sender_id: str | None, nickname: str) -> str:
-    sender = str(sender_id or nickname or "unknown").strip() or "unknown"
+def person_id(user_id: str, sender_id: str | None) -> str:
+    """构建稳定的 person_id。
+
+    群聊：group_群号:QQ号（复用 user_id 已含的 group_ 前缀）
+    私聊：private_QQ号（不用 user_id，避免 private_987:987 重复）
+    """
+    sender = str(sender_id or "unknown").strip() or "unknown"
     safe = sender.replace("\n", " ").replace("\r", " ")
-    return f"{session_id}:{safe}"
+    if user_id.startswith("group_"):
+        return f"{user_id}:{safe}"
+    return f"private_{safe}"
+
+
+def extract_msg_content(content: str) -> str:
+    """从 history content 中提取纯消息文本。
+
+    新格式：<sender ...>消息</sender> → 提取 > 和 </sender> 之间的文本
+    旧格式：<昵称> 消息 → 取 > 后面的部分
+    """
+    if "</sender>" in content:
+        m = re.search(r"<sender[^>]*>(.*)</sender>", content, re.DOTALL)
+        if m:
+            return m.group(1)
+        return content
+    # 旧格式：<昵称> 消息
+    idx = content.find("> ")
+    if idx >= 0:
+        return content[idx + 2:]
+    return content
 
 
 def history_text(history: list[HistoryMsg]) -> str:
-    user_msgs = [h for h in history if h.get("role") == "user"]
+    """把历史转为给结算模型看的文本，输出 <sender> 格式。
+
+    新消息（含 person_id 等字段）：输出完整 sender 标签
+    旧消息（只有 nickname）：输出简化 sender 标签，只填 display
+    """
     lines: list[str] = []
-    for h in user_msgs:
+    for h in history:
+        if h.get("role") != "user":
+            continue
         content = h.get("content", "")
-        ts = h.get("ts")
-        pid = h.get("person_id", "")
-        tag = f"[{ts}]" if ts else ""
-        pid_tag = f"({pid})" if pid else ""
-        lines.append(f"{tag}{pid_tag} {content}" if tag or pid_tag else content)
+        # 新格式已有 sender 标签
+        if "</sender>" in content:
+            lines.append(content)
+            continue
+        # 旧格式或无标签：用 nickname 构造简化 sender
+        nickname = h.get("nickname") or h.get("sender_id") or "unknown"
+        ts = h.get("ts", "")
+        ts_attr = f' ts="{ts}"' if ts else ""
+        msg = extract_msg_content(content) if "<" in content[:5] else content
+        lines.append(f'<sender display="{nickname}"{ts_attr}>{msg}</sender>')
     return "\n".join(lines)

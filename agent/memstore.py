@@ -354,64 +354,42 @@ def _mem_search(query: str) -> dict[str, list[MemSearchItem]]:
         return {"results": []}
 
 
-# ── 记忆检索（滚雪球） ──────────────────────────────────
+# ── 记忆检索（单轮） ────────────────────────────────────
 
 
-async def search_memories(query: str, max_rounds: int = 2,
-                          capture: bool = False, user_ctx: UserCtx | None = None) -> list[MemSearchItem]:
-    """滚雪球记忆检索，直到 id 集合闭合或达到最大轮数"""
+async def search_memories(query: str, capture: bool = False, user_ctx: UserCtx | None = None) -> list[MemSearchItem]:
+    """单轮记忆检索：海选(Embedding分) → 选拔(Reranker分)，双门槛全入围"""
     global _last_mem0_diag
-    known: dict[str, MemSearchItem] = {}
-    q: str = query
     rounds_diag: list[Mem0Diag] = []
 
-    for _ in range(max_rounds):
-        async with mem0_lock:
-            result = _mem_search(q)
+    async with mem0_lock:
+        result = _mem_search(query)
 
-        # 捕获本轮诊断
-        if capture:
-            if _last_mem0_diag:
-                _last_mem0_diag["round"] = len(rounds_diag) + 1
-                _last_mem0_diag["round_query"] = q[:100]
-                rounds_diag.append(cast(Mem0Diag, dict(_last_mem0_diag)))
+    # 捕获诊断
+    if capture:
+        if _last_mem0_diag:
+            _last_mem0_diag["round"] = 1
+            _last_mem0_diag["round_query"] = query[:100]
+            rounds_diag.append(cast(Mem0Diag, dict(_last_mem0_diag)))
 
-        if not result:
-            print(f"[Mem0] 搜索返回异常: {result}")
-            break
-
+    if not result:
+        print(f"[Mem0] 搜索返回异常: {result}")
+    else:
         items = result.get("results", [])
-        print(f"[Mem0] 搜索 '{q[:30]}...' → {len(items)} 条")
+        print(f"[Mem0] 搜索 '{query[:30]}...' → {len(items)} 条")
         for item in items:
             if not item:
                 continue
             score = float(item.get("score", 0))
             print(f"  [{str(item.get('id', '?'))[:12]}] {str(item.get('memory', ''))[:60]} ({score:.3f})")
-        new_count = 0
-        for item in items:
-            if not item:
-                continue
-            mid = str(item.get("id", ""))
-            if mid and mid not in known:
-                known[mid] = item
-                new_count += 1
 
-        if new_count == 0:
-            break
-
-        # 拼接下轮 query
-        parts: list[str] = [query]
-        for m in known.values():
-            if not m:
-                continue
-            meta = m.get("metadata") or {}
-            spoken_by_raw = meta.get("spoken_by", "未知")
-            spoken_by = format_spoken_by(spoken_by_raw)
-            parts.append(f"[{spoken_by}] {m.get('memory', '')}")
-        q = "\n".join(parts)
-        # 限制 query 长度，避免超过 Mem0 的 512 token 限制
-        if len(q) > 2000:
-            q = q[:2000]
+    known: dict[str, MemSearchItem] = {}
+    for item in (result.get("results", []) if result else []):
+        if not item:
+            continue
+        mid = str(item.get("id", ""))
+        if mid and mid not in known:
+            known[mid] = item
 
     # 记录到环形缓冲
     if capture and rounds_diag:
