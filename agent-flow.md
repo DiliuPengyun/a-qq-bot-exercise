@@ -53,24 +53,21 @@ flowchart TD
 
     LDONE --> REPAIR
 
-    subgraph REPAIR["📄 最后一轮 repair（仅失败时触发）"]
-        R1{"有 &lt;message&gt; 或 draft？"}
-        R1 -- 都没有 --> R2["CHAT_REPAIR<br/>一次修 mood+message<br/>修出的 message 推送"]
-        R1 -- 有 --> R3{"mood 有效？"}
-        R3 -- 无 --> R4["MOOD_REPAIR<br/>单独修 mood"]
-        R3 -- 有 --> R5["跳过"]
+    subgraph REPAIR["📄 最后一轮 repair（仅 mood 失败时触发）"]
+        R1{"mood 有效？"}
+        R1 -- 无 --> R2["MOOD_REPAIR<br/>让模型重发 mood<br/>（message 不是必填，不 repair）"]
+        R1 -- 有 --> R3["跳过"]
     end
 
     R2 --> FINAL
-    R4 --> FINAL
-    R5 --> FINAL
+    R3 --> FINAL
 
     subgraph FINAL["💾 收尾"]
         F1["未闭合 draft 留 ctx<br/>下轮 acquire 读走"]
-        F2["保存历史<br/>user + bot 均 &lt;sender&gt; 标签"]
+        F2["保存历史<br/>user 消息必存<br/>bot 回复有就存（不回就不存）"]
         F3["后台 safe_settle（不阻塞）"]
         F1 --> F2 --> F3
     end
 
-    F3 --> SSE_DONE["SSE 推送 done event<br/>adapter 结束读取"]
+    F3 --> SSE_DONE["SSE 推送 done event<br/>adapter 结束读取<br/>（无 message 则用户无感知）"]
 ```

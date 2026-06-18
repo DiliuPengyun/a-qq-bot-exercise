@@ -15,7 +15,6 @@ import httpx
 from concurrency import GenerationContext
 from config import (
     BOT_NAME,
-    CHAT_REPAIR_PROMPT,
     DEEPSEEK_KEY,
     DEEPSEEK_URL,
     DYNAMIC_PROMPT_FILE,
@@ -40,7 +39,6 @@ from models import (
 from mood import format_mood_for_prompt, update_mood
 from parsing import (
     extract_complete_and_draft,
-    parse_for_repair,
     parse_mood,
 )
 from sessions import get_history, save_history
@@ -383,35 +381,16 @@ async def call_deepseek(
             tools_for_next = TOOLS if turn < MAX_TOOL_TURNS else None
 
     # ── 以下为最后一轮的后处理（取消时不会执行）──
-    #    repair 只在最后一轮触发：中间轮模型可能只输出 tool_call 不输出 message，属正常。
+    #    message 不是必填项：模型不输出 <message> = 有意不回（群聊插不上嘴等），不 repair。
+    #    mood 是必填项：无效时 repair 让模型重发。
 
-    # repair 策略：
-    #   - message 完全缺失（无已闭合也无 draft）→ CHAT_REPAIR 一次修 mood+message
-    #   - message 有效但 mood 无效 → 单独 MOOD_REPAIR 只修 mood
-    final_messages = complete_messages
-    if not final_messages and not last_draft:
-        print("[Chat] 无回复内容，尝试修复...")
-        repaired = await repair_until_valid(
-            parse_for_repair, CHAT_REPAIR_PROMPT,
-            content_buffer, "ChatParse", max_retries=2,
-        )
-        if repaired is not None:
-            final_messages = repaired.get("messages", [])
-            last_draft = ""  # repair 产出的视为完整闭合，无 draft
-            # 推送 repair 出的 message
-            if final_messages and on_reply is not None:
-                for msg in final_messages:
-                    await on_reply(msg, quote)
-            # CHAT_REPAIR 同时修了 mood，优先取它（避免覆盖原本有效的 mood）
-            if last_parsed_mood is None:
-                last_parsed_mood = repaired.get("mood")
-    elif last_parsed_mood is None:
+    # mood 无效 → repair 让模型重发
+    if last_parsed_mood is None:
         print("[Chat] mood 缺失或无效，尝试修复...")
         last_parsed_mood = await repair_until_valid(
             parse_mood, MOOD_REPAIR_PROMPT,
             content_buffer, "MoodParse", max_retries=2,
         )
-        # repair 出的 mood 也要更新
         if last_parsed_mood:
             update_mood(last_parsed_mood)
 
@@ -434,7 +413,7 @@ async def call_deepseek(
     bot_ts = now_minute()
     bot_pid = person_id(user_id, bot_qq) if bot_qq else "bot"
     bot_display = BOT_NAME
-    for rep in final_messages:
+    for rep in complete_messages:
         bot_tag = _build_sender_tag(
             bot_display, "female", bot_pid, BOT_NAME, BOT_NAME, bot_ts, rep
         )

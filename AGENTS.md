@@ -194,8 +194,8 @@ User Prompt (每轮不同)
 - 跨轮 buffer：`content_buffer` 跨轮累加，已推送的 message 用 `prev_complete_count` 跳过（防重复），mood 用 `mood_offset` 跳过（防重复匹配旧 mood）
 - 未闭合的 `<message>`（模型说了半句就去调工具）不发送，留在 buffer 里；`assistant_msg` 带 content，模型下一轮能看到自己说过什么，自行决定续写或重写
 - 最后一轮的 repair 策略：
-  - 完全无 message 且无 draft → `CHAT_REPAIR` 一次修 mood+message（修出的 message 推送）
-  - message 有效但 mood 无效 → 单独 `MOOD_REPAIR` 只修 mood
+  - **message 不是必填项**：模型不输出 `<message>` = 有意不回（群聊插不上嘴等），不 repair、不逼模型说话
+  - mood 是必填项：无效时 `MOOD_REPAIR` 让模型重发（最多 2 次）
 - **解析方式演变（2026-06-18）**：
   - 初版用 ElementTree 整体解析 `f"<root>{output}</root>"`，模型输出中任何非法 XML 字符（未转义 `<`/`>`/`&`、标签不匹配、未闭合等）都会导致 `ET.ParseError`，整个输出作废（message 和 mood 全丢）
   - 先尝试下游打补丁：检测 XML 解析失败后走 `repair_until_valid` 调 DeepSeek 修复，并按「有完整 message / 有 draft / 完全无内容」分三个分支处理。逻辑复杂且仍丢 mood
@@ -402,7 +402,7 @@ gitignore 重点：
   - `agent/parsing.py` 新模块：解析函数从 `chat.py` 抽出（`parse_mood` / `parse_model_output` / `parse_for_repair` / `extract_complete_and_draft`），纯正则不依赖 XML 整体解析，可独立单元测试
   - **工具调用多轮循环**：`MAX_TOOL_TURNS=3`，每轮结束后立即解析 mood（`update_mood`）和 message（通过 `on_reply` 回调推送）；跨轮 buffer 累加，`prev_complete_count` 防重复推送 message，`mood_offset` 防重复匹配旧 mood
   - **未闭合 message 留作草稿续写**：模型说了半句就去调工具时不发送，留 buffer 里；`assistant_msg` 带 content，模型下一轮能看到自己说过什么，自行决定续写或重写
-  - **repair 策略合并**：完全无 message 且无 draft → `CHAT_REPAIR` 一次修 mood+message；message 有效但 mood 无效 → 单独 `MOOD_REPAIR`。mood 是必须项，不静默跳过
+  - **repair 策略**：message 不是必填项（模型有意不回不 repair、不逼说话）；mood 是必填项，无效时 `MOOD_REPAIR` 让模型重发
   - **tool args 非法 JSON 不抛异常**：`handle_tool_calls` 里 `json.loads` 包 try/except，解析失败回传 `role:tool` 错误消息让模型重调（function calling 协议标准错误回流通道）
   - **agent↔adapter 接口改 SSE**：`/chat` 从 JSON 请求-响应改为 SSE 流式，每条 message 作为 event 推送，adapter `call_agent` 改 `httpx.stream()` + `aiter_lines()` 读流，收到就立即发 QQ。取消路径推送 `{"cancelled": true}` 关闭流，已推送的 message 早已发出
   - `GenerationContext` 删 `complete_messages`（逐轮推送后取消路径靠 SSE 已推送）
